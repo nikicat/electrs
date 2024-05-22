@@ -5,8 +5,9 @@ use bitcoin::{Amount, BlockHash, Transaction, Txid};
 use bitcoincore_rpc::{json, jsonrpc, Auth, Client, RpcApi};
 use crossbeam_channel::Receiver;
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde_json;
 use serde_json::{json, value::RawValue, Value};
+use serde::{Deserialize, Serialize};
 
 use std::fs::File;
 use std::io::Read;
@@ -20,14 +21,35 @@ use crate::{
     signals::ExitFlag,
     types::SerBlock,
 };
-
 enum PollResult {
     Done(Result<()>),
     Retry,
 }
 
+
+/// Models the result of "getblockchaininfo"
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GetBlockchainInfoResult {
+    /// The current number of blocks processed in the server
+    pub blocks: u64,
+    /// The current number of headers we have validated
+    pub headers: u64,
+    #[serde(rename = "initialblockdownload")]
+    pub initial_block_download: bool,
+    pub pruned: bool,
+}
+
+pub type BitcoinResult<T> = std::result::Result<T, bitcoincore_rpc::Error>;
+
+/// Returns a data structure containing various state info regarding
+/// blockchain processing.
+fn get_blockchain_info(client: &Client) -> BitcoinResult<GetBlockchainInfoResult> {
+    let raw: serde_json::Value = client.call("getblockchaininfo", &[])?;
+    Ok(serde_json::from_value(raw)?)
+}
+
 fn rpc_poll(client: &mut Client, skip_block_download_wait: bool) -> PollResult {
-    match client.get_blockchain_info() {
+    match get_blockchain_info(client) {
         Ok(info) => {
             if skip_block_download_wait {
                 // bitcoind RPC is available, don't wait for block download to finish
@@ -133,7 +155,7 @@ impl Daemon {
         if !network_info.network_active {
             bail!("electrs requires active bitcoind p2p network");
         }
-        let info = rpc.get_blockchain_info()?;
+        let info = get_blockchain_info(&rpc)?;
         if info.pruned {
             bail!("electrs requires non-pruned bitcoind node");
         }

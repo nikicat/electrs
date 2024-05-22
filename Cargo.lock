@@ -392,6 +392,7 @@ version = "0.10.5"
 dependencies = [
  "anyhow",
  "bitcoin",
+ "bitcoin-internals",
  "bitcoin-test-data",
  "bitcoin_slices",
  "bitcoincore-rpc",

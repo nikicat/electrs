@@ -47,6 +47,10 @@ default-features = false
 # Snappy is only for checking old DB
 features = ["zstd", "snappy"]
 
+[dependencies.internals]
+version = "0.3.0"
+package = "bitcoin-internals"
+
 [build-dependencies]
 configure_me_codegen = { version = "0.4.4", default-features = false }
 

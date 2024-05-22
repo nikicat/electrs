@@ -92,32 +92,55 @@ impl ResolvAddr {
 }
 
 /// This newtype implements `ParseArg` for `Network`.
-#[derive(Deserialize)]
-pub struct BitcoinNetwork(Network);
+#[derive(Copy, PartialEq, Eq, PartialOrd, Ord, Clone, Hash, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum BitcoinNetwork {
+    Base(Network),
+    /// Bitcoin's testnet4 network.
+    Testnet4,
+}
+
+impl BitcoinNetwork {
+    pub fn magic(self) -> Magic {
+        match self {
+            BitcoinNetwork::Testnet4 => Magic::from_str("1c163f28").unwrap(),
+            Self::Base(base) => Magic::from(base),
+        }
+    }
+}
 
 impl Default for BitcoinNetwork {
     fn default() -> Self {
-        BitcoinNetwork(Network::Bitcoin)
+        Self::Base(Network::Bitcoin)
     }
 }
 
 impl FromStr for BitcoinNetwork {
-    type Err = <Network as FromStr>::Err;
+    type Err = bitcoin::network::ParseNetworkError;
 
     fn from_str(string: &str) -> std::result::Result<Self, Self::Err> {
-        Network::from_str(string).map(BitcoinNetwork)
+            match string {
+                "testnet4" => Ok(Self::Testnet4),
+                _ => Network::from_str(string).map(|n| BitcoinNetwork::Base(n)),
+            }
+    }
+}
+
+impl fmt::Display for BitcoinNetwork {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        use BitcoinNetwork::*;
+
+        match *self {
+            Testnet4 => write!(f, "testnet4"),
+            Base(n) => Network::fmt(&n, f),
+        }
     }
 }
 
 impl ::configure_me::parse_arg::ParseArgFromStr for BitcoinNetwork {
     fn describe_type<W: fmt::Write>(mut writer: W) -> fmt::Result {
-        write!(writer, "either 'bitcoin', 'testnet', 'regtest' or 'signet'")
-    }
-}
-
-impl From<BitcoinNetwork> for Network {
-    fn from(network: BitcoinNetwork) -> Network {
-        network.0
+        write!(writer, "either 'bitcoin', 'testnet', 'regtest', 'signet' or 'testnet4'")
     }
 }
 
@@ -125,7 +148,7 @@ impl From<BitcoinNetwork> for Network {
 #[derive(Debug)]
 pub struct Config {
     // See below for the documentation of each field:
-    pub network: Network,
+    pub network: BitcoinNetwork,
     pub db_path: PathBuf,
     pub db_log_dir: Option<PathBuf>,
     pub daemon_dir: PathBuf,
@@ -194,57 +217,63 @@ impl Config {
     /// Parses args, env vars, config files and post-processes them
     pub fn from_args() -> Config {
         use internal::ResultExt;
+        use BitcoinNetwork::*;
 
         let (mut config, args) =
             internal::Config::including_optional_config_files(default_config_files())
                 .unwrap_or_exit();
 
-        fn unsupported_network(network: Network) -> ! {
+        fn unsupported_network(network: BitcoinNetwork) -> ! {
             eprintln!("Error: unsupported network: {}", network);
             std::process::exit(1);
         }
 
         let db_subdir = match config.network {
-            Network::Bitcoin => "bitcoin",
-            Network::Testnet => "testnet",
-            Network::Regtest => "regtest",
-            Network::Signet => "signet",
+            Base(Network::Bitcoin) => "bitcoin",
+            Base(Network::Testnet) => "testnet",
+            Base(Network::Regtest) => "regtest",
+            Base(Network::Signet) => "signet",
+            Testnet4 => "testnet4",
             unsupported => unsupported_network(unsupported),
         };
 
         config.db_dir.push(db_subdir);
 
         let default_daemon_rpc_port = match config.network {
-            Network::Bitcoin => 8332,
-            Network::Testnet => 18332,
-            Network::Regtest => 18443,
-            Network::Signet => 38332,
+            Base(Network::Bitcoin) => 8332,
+            Base(Network::Testnet) => 18332,
+            Base(Network::Regtest) => 18443,
+            Base(Network::Signet) => 38332,
+            Testnet4 => 48332,
             unsupported => unsupported_network(unsupported),
         };
         let default_daemon_p2p_port = match config.network {
-            Network::Bitcoin => 8333,
-            Network::Testnet => 18333,
-            Network::Regtest => 18444,
-            Network::Signet => 38333,
+            Base(Network::Bitcoin) => 8333,
+            Base(Network::Testnet) => 18333,
+            Base(Network::Regtest) => 18444,
+            Base(Network::Signet) => 38333,
+            Testnet4 => 48333,
             unsupported => unsupported_network(unsupported),
         };
         let default_electrum_port = match config.network {
-            Network::Bitcoin => 50001,
-            Network::Testnet => 60001,
-            Network::Regtest => 60401,
-            Network::Signet => 60601,
+            Base(Network::Bitcoin) => 50001,
+            Base(Network::Testnet) => 60001,
+            Base(Network::Regtest) => 60401,
+            Base(Network::Signet) => 60601,
+            Testnet4 => 60801,
             unsupported => unsupported_network(unsupported),
         };
         let default_monitoring_port = match config.network {
-            Network::Bitcoin => 4224,
-            Network::Testnet => 14224,
-            Network::Regtest => 24224,
-            Network::Signet => 34224,
+            Base(Network::Bitcoin) => 4224,
+            Base(Network::Testnet) => 14224,
+            Base(Network::Regtest) => 24224,
+            Base(Network::Signet) => 34224,
+            Testnet4 => 44224,
             unsupported => unsupported_network(unsupported),
         };
 
         let magic = match (config.network, config.signet_magic) {
-            (Network::Signet, Some(magic)) => magic.parse().unwrap_or_else(|error| {
+            (Base(Network::Signet), Some(magic)) => magic.parse().unwrap_or_else(|error| {
                 eprintln!(
                     "Error: signet magic '{}' is not a valid hex string: {}",
                     magic, error
@@ -283,10 +312,11 @@ impl Config {
         );
 
         match config.network {
-            Network::Bitcoin => (),
-            Network::Testnet => config.daemon_dir.push("testnet3"),
-            Network::Regtest => config.daemon_dir.push("regtest"),
-            Network::Signet => config.daemon_dir.push("signet"),
+            Base(Network::Bitcoin) => (),
+            Base(Network::Testnet) => config.daemon_dir.push("testnet3"),
+            Base(Network::Regtest) => config.daemon_dir.push("regtest"),
+            Base(Network::Signet) => config.daemon_dir.push("signet"),
+            Testnet4 => config.daemon_dir.push("testnet4"),
             unsupported => unsupported_network(unsupported),
         }
 

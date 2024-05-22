@@ -15,7 +15,7 @@ use bitcoin::{
         message_network, Magic,
     },
     secp256k1::{self, rand::Rng},
-    Block, BlockHash, Network,
+    Block, BlockHash,
 };
 use bitcoin_slices::{bsl, Parse};
 use crossbeam_channel::{bounded, select, Receiver, Sender};
@@ -24,6 +24,7 @@ use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::config::BitcoinNetwork;
 use crate::types::SerBlock;
 use crate::{
     chain::{Chain, NewHeader},
@@ -136,7 +137,7 @@ impl Connection {
     }
 
     pub(crate) fn connect(
-        network: Network,
+        network: BitcoinNetwork,
         address: SocketAddr,
         metrics: &Metrics,
         magic: Magic,

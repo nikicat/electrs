@@ -57,28 +57,27 @@ doc = "JSONRPC authentication cookie file (default: ~/.bitcoin/.cookie)"
 [[param]]
 name = "network"
 type = "crate::config::BitcoinNetwork"
-convert_into = "::bitcoin::Network"
-doc = "Select Bitcoin network type ('bitcoin', 'testnet', 'regtest' or 'signet')"
+doc = "Select Bitcoin network type ('bitcoin', 'testnet', 'regtest', 'signet' or 'testnet4')"
 default = "Default::default()"
 
 [[param]]
 name = "electrum_rpc_addr"
 type = "crate::config::ResolvAddr"
-doc = "Electrum server JSONRPC 'addr:port' to listen on (default: '127.0.0.1:50001' for mainnet, '127.0.0.1:60001' for testnet, '127.0.0.1:60401' for regtest and '127.0.0.1:60601' for signet)"
+doc = "Electrum server JSONRPC 'addr:port' to listen on (default: '127.0.0.1:50001' for mainnet, '127.0.0.1:60001' for testnet, '127.0.0.1:60401' for regtest, '127.0.0.1:60601' for signet and '127.0.0.1:60801' for testnet4)"
 
 [[param]]
 name = "daemon_rpc_addr"
 type = "crate::config::ResolvAddr"
-doc = "Bitcoin daemon JSONRPC 'addr:port' to connect (default: 127.0.0.1:8332 for mainnet, 127.0.0.1:18332 for testnet, 127.0.0.1:18443 for regtest and 127.0.0.1:18554 for signet)"
+doc = "Bitcoin daemon JSONRPC 'addr:port' to connect (default: 127.0.0.1:8332 for mainnet, 127.0.0.1:18332 for testnet, 127.0.0.1:18443 for regtest, 127.0.0.1:18554 for signet and 127.0.0.1:48332 for testnet4)"
 [[param]]
 name = "daemon_p2p_addr"
 type = "crate::config::ResolvAddr"
-doc = "Bitcoin daemon p2p 'addr:port' to connect (default: 127.0.0.1:8333 for mainnet, 127.0.0.1:18333 for testnet, 127.0.0.1:18444 for regtest and 127.0.0.1:38333 for signet)"
+doc = "Bitcoin daemon p2p 'addr:port' to connect (default: 127.0.0.1:8333 for mainnet, 127.0.0.1:18333 for testnet, 127.0.0.1:18444 for regtest, 127.0.0.1:38333 for signet and 127.0.0.1:48333 for testnet4)"
 
 [[param]]
 name = "monitoring_addr"
 type = "crate::config::ResolvAddr"
-doc = "Prometheus monitoring 'addr:port' to listen on (default: 127.0.0.1:4224 for mainnet, 127.0.0.1:14224 for testnet, 127.0.0.1:24224 for regtest and 127.0.0.1:34224 for signet)"
+doc = "Prometheus monitoring 'addr:port' to listen on (default: 127.0.0.1:4224 for mainnet, 127.0.0.1:14224 for testnet, 127.0.0.1:24224 for regtest, 127.0.0.1:34224 for signet and 127.0.0.1:44224 for testnet4)"
 
 [[param]]
 name = "wait_duration_secs"

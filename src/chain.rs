@@ -1,7 +1,10 @@
 use std::collections::HashMap;
+use std::str::FromStr;
 
 use bitcoin::blockdata::block::Header as BlockHeader;
-use bitcoin::{BlockHash, Network};
+use bitcoin::{BlockHash, TxMerkleNode};
+
+use crate::config::BitcoinNetwork;
 
 /// A new header found, to be added to the chain at specific height
 pub(crate) struct NewHeader {
@@ -36,11 +39,35 @@ pub struct Chain {
 
 impl Chain {
     // create an empty chain
-    pub fn new(network: Network) -> Self {
-        let genesis = bitcoin::blockdata::constants::genesis_block(network);
-        let genesis_hash = genesis.block_hash();
+    pub fn new(network: BitcoinNetwork) -> Self {
+        let (genesis_header, genesis_hash) = match network {
+            BitcoinNetwork::Base(n) => {
+                let genesis = bitcoin::blockdata::constants::genesis_block(n);
+                let genesis_hash = genesis.block_hash();
+                (genesis.header, genesis_hash)
+            }
+            BitcoinNetwork::Testnet4 => {
+                let genesis_header = BlockHeader {
+                    version: bitcoin::blockdata::block::Version::ONE,
+                    prev_blockhash: <BlockHash as bitcoin::hashes::Hash>::all_zeros(),
+                    merkle_root: TxMerkleNode::from_str(
+                        "7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e",
+                    )
+                    .unwrap(),
+                    time: 1714777860,
+                    bits: bitcoin::CompactTarget::from_consensus(0x1d00ffff),
+                    nonce: 393743547,
+                };
+
+                let genesis_hash = BlockHash::from_str(
+                    "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043",
+                )
+                .unwrap();
+                (genesis_header, genesis_hash)
+            }
+        };
         Self {
-            headers: vec![(genesis_hash, genesis.header)],
+            headers: vec![(genesis_hash, genesis_header)],
             heights: std::iter::once((genesis_hash, 0)).collect(), // genesis header @ zero height
         }
     }
@@ -144,6 +171,8 @@ impl Chain {
 
 #[cfg(test)]
 mod tests {
+    use crate::config::BitcoinNetwork;
+
     use super::{Chain, NewHeader};
     use bitcoin::blockdata::block::Header as BlockHeader;
     use bitcoin::consensus::deserialize;
@@ -152,7 +181,7 @@ mod tests {
 
     #[test]
     fn test_genesis() {
-        let regtest = Chain::new(Regtest);
+        let regtest = Chain::new(BitcoinNetwork::Base(Regtest));
         assert_eq!(regtest.height(), 0);
         assert_eq!(
             regtest.tip(),
@@ -182,7 +211,7 @@ hex!("000000200030d7f9c11ef35b89a0eefb9a5e449909339b5e7854d99804ea8d6a49bf900a03
             .collect();
 
         for chunk_size in 1..headers.len() {
-            let mut regtest = Chain::new(Regtest);
+            let mut regtest = Chain::new(BitcoinNetwork::Base(Regtest));
             let mut height = 0;
             let mut tip = regtest.tip();
             for chunk in headers.chunks(chunk_size) {
@@ -201,7 +230,7 @@ hex!("000000200030d7f9c11ef35b89a0eefb9a5e449909339b5e7854d99804ea8d6a49bf900a03
         }
 
         // test loading from a list of headers and tip
-        let mut regtest = Chain::new(Regtest);
+        let mut regtest = Chain::new(BitcoinNetwork::Base(Regtest));
         regtest.load(headers.clone(), headers.last().unwrap().block_hash());
         assert_eq!(regtest.height(), headers.len());
 
@@ -238,7 +267,7 @@ hex!("000000200030d7f9c11ef35b89a0eefb9a5e449909339b5e7854d99804ea8d6a49bf900a03
         );
 
         // test reorg
-        let mut regtest = Chain::new(Regtest);
+        let mut regtest = Chain::new(BitcoinNetwork::Base(Regtest));
         regtest.load(headers.clone(), headers.last().unwrap().block_hash());
         let height = regtest.height();
 
