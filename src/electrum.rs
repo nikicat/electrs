@@ -221,7 +221,7 @@ impl Rpc {
 
     fn block_headers(&self, (start_height, count): (usize, usize)) -> Result<Value> {
         let chain = self.tracker.chain();
-        let max_count = 2016usize;
+        let max_count = 20160usize;
         // return only the available block headers
         let end_height = std::cmp::min(
             chain.height() + 1,
