@@ -26,7 +26,7 @@ impl<'a> Iterator for ScanIterator<'a> {
         if self.done {
             return None;
         }
-        let (key, value) = self.iter.next()?;
+        let Ok((key, value)) = self.iter.next()? else { todo!() };
         if !key.starts_with(&self.prefix) {
             self.done = true;
             return None;
