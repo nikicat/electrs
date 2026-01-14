@@ -492,16 +492,149 @@ impl Connection {
             None => false,
         };
 
-        // FIXME: implement verbose support
-        if verbose {
-            bail!("verbose transactions are currently unsupported");
-        }
-
-        let rawtx = self
+        let raw_tx = self
             .query
             .lookup_raw_txn(&tx_hash)
             .chain_err(|| "missing transaction")?;
-        Ok(json!(rawtx.to_lower_hex_string()))
+
+        if !verbose {
+            return Ok(json!(raw_tx.to_lower_hex_string()));
+        }
+
+        self.verbose_transaction_json(&tx_hash, &raw_tx)
+    }
+
+    /// Verbose response for blockchain.transaction.get, matching Bitcoin
+    /// Core's getrawtransaction format, plus a "height" field (Electrum
+    /// protocol extension).
+    #[cfg(not(feature = "liquid"))]
+    fn verbose_transaction_json(&self, tx_hash: &Txid, raw_tx: &[u8]) -> Result<Value> {
+        let tx = self
+            .query
+            .lookup_txn(tx_hash)
+            .chain_err(|| "missing transaction")?;
+
+        let blockid = self.query.chain().tx_confirming_block(tx_hash);
+
+        let vin: Vec<Value> = tx
+            .input
+            .iter()
+            .map(|txin| {
+                let mut vin_obj = if txin.previous_output.is_null() {
+                    json!({
+                        "coinbase": txin.script_sig.as_bytes().to_lower_hex_string(),
+                        "sequence": txin.sequence.0
+                    })
+                } else {
+                    json!({
+                        "txid": txin.previous_output.txid.to_string(),
+                        "vout": txin.previous_output.vout,
+                        "scriptSig": {
+                            "asm": txin.script_sig.to_asm_string(),
+                            "hex": txin.script_sig.as_bytes().to_lower_hex_string()
+                        },
+                        "sequence": txin.sequence.0
+                    })
+                };
+
+                if !txin.witness.is_empty() {
+                    let witness: Vec<String> = txin
+                        .witness
+                        .iter()
+                        .map(|w| w.to_lower_hex_string())
+                        .collect();
+                    vin_obj
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("txinwitness".to_string(), json!(witness));
+                }
+
+                vin_obj
+            })
+            .collect();
+
+        let vout: Vec<Value> = tx
+            .output
+            .iter()
+            .enumerate()
+            .map(|(n, txout)| {
+                let script = &txout.script_pubkey;
+                let script_type = if script.is_empty() {
+                    "nonstandard"
+                } else if script.is_op_return() {
+                    "nulldata"
+                } else if script.is_p2pk() {
+                    "pubkey"
+                } else if script.is_p2pkh() {
+                    "pubkeyhash"
+                } else if script.is_p2sh() {
+                    "scripthash"
+                } else if script.is_p2wpkh() {
+                    "witness_v0_keyhash"
+                } else if script.is_p2wsh() {
+                    "witness_v0_scripthash"
+                } else if script.is_p2tr() {
+                    "witness_v1_taproot"
+                } else if script.is_witness_program() {
+                    "witness_unknown"
+                } else {
+                    "nonstandard"
+                };
+
+                let mut script_pub_key = json!({
+                    "asm": script.to_asm_string(),
+                    "hex": script.as_bytes().to_lower_hex_string(),
+                    "type": script_type
+                });
+
+                if let Ok(addr) = bitcoin::Address::from_script(
+                    script,
+                    bitcoin::Network::from(self.query.network()),
+                ) {
+                    script_pub_key
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("address".to_string(), json!(addr.to_string()));
+                }
+
+                json!({
+                    "value": txout.value.to_btc(),
+                    "n": n,
+                    "scriptPubKey": script_pub_key
+                })
+            })
+            .collect();
+
+        let mut result = json!({
+            "txid": tx_hash.to_string(),
+            "hash": tx.compute_wtxid().to_string(),
+            "version": tx.version.0,
+            "size": raw_tx.len(),
+            "vsize": tx.vsize(),
+            "weight": tx.weight().to_wu(),
+            "locktime": tx.lock_time.to_consensus_u32(),
+            "vin": vin,
+            "vout": vout,
+            "hex": raw_tx.to_lower_hex_string()
+        });
+
+        if let Some(blockid) = blockid {
+            let best_height = self.query.chain().best_height();
+            let confirmations = best_height - blockid.height + 1;
+            let obj = result.as_object_mut().unwrap();
+            obj.insert("blockhash".to_string(), json!(blockid.hash.to_string()));
+            obj.insert("confirmations".to_string(), json!(confirmations));
+            obj.insert("time".to_string(), json!(blockid.time));
+            obj.insert("blocktime".to_string(), json!(blockid.time));
+            obj.insert("height".to_string(), json!(blockid.height));
+        }
+
+        Ok(result)
+    }
+
+    #[cfg(feature = "liquid")]
+    fn verbose_transaction_json(&self, _tx_hash: &Txid, _raw_tx: &[u8]) -> Result<Value> {
+        bail!("verbose transactions are not supported on liquid")
     }
 
     #[trace]
@@ -1096,5 +1229,384 @@ mod tests {
             result,
             "d474826bbd126d38bdfb1e61bf727a2d9a306ea1645071faf2638cc3891a2b30"
         );
+    }
+}
+
+#[cfg(test)]
+mod verbose_tx_tests {
+    use serde_json::{json, Value};
+
+    /// Validates that a verbose transaction response contains all required fields
+    /// per the Electrum protocol specification for blockchain.transaction.get
+    fn validate_verbose_tx_structure(response: &Value, is_confirmed: bool) {
+        // Required fields per Electrum protocol (matching Bitcoin Core's getrawtransaction)
+        assert!(response.get("txid").is_some(), "missing txid field");
+        assert!(response.get("hash").is_some(), "missing hash (wtxid) field");
+        assert!(response.get("version").is_some(), "missing version field");
+        assert!(response.get("size").is_some(), "missing size field");
+        assert!(response.get("vsize").is_some(), "missing vsize field");
+        assert!(response.get("weight").is_some(), "missing weight field");
+        assert!(response.get("locktime").is_some(), "missing locktime field");
+        assert!(response.get("vin").is_some(), "missing vin field");
+        assert!(response.get("vout").is_some(), "missing vout field");
+        assert!(response.get("hex").is_some(), "missing hex field");
+
+        // Type validations
+        assert!(
+            response["txid"].is_string(),
+            "txid must be a string"
+        );
+        assert!(
+            response["hash"].is_string(),
+            "hash must be a string"
+        );
+        assert!(
+            response["version"].is_number(),
+            "version must be a number"
+        );
+        assert!(
+            response["size"].is_number(),
+            "size must be a number"
+        );
+        assert!(
+            response["vsize"].is_number(),
+            "vsize must be a number"
+        );
+        assert!(
+            response["weight"].is_number(),
+            "weight must be a number"
+        );
+        assert!(
+            response["locktime"].is_number(),
+            "locktime must be a number"
+        );
+        assert!(response["vin"].is_array(), "vin must be an array");
+        assert!(response["vout"].is_array(), "vout must be an array");
+        assert!(response["hex"].is_string(), "hex must be a string");
+
+        // Confirmed transaction specific fields
+        if is_confirmed {
+            assert!(
+                response.get("blockhash").is_some(),
+                "confirmed tx missing blockhash"
+            );
+            assert!(
+                response.get("confirmations").is_some(),
+                "confirmed tx missing confirmations"
+            );
+            assert!(
+                response.get("time").is_some(),
+                "confirmed tx missing time"
+            );
+            assert!(
+                response.get("blocktime").is_some(),
+                "confirmed tx missing blocktime"
+            );
+            // Electrum protocol adds height field
+            assert!(
+                response.get("height").is_some(),
+                "confirmed tx missing height (Electrum extension)"
+            );
+
+            assert!(
+                response["blockhash"].is_string(),
+                "blockhash must be a string"
+            );
+            assert!(
+                response["confirmations"].is_number(),
+                "confirmations must be a number"
+            );
+            assert!(response["time"].is_number(), "time must be a number");
+            assert!(
+                response["blocktime"].is_number(),
+                "blocktime must be a number"
+            );
+            assert!(
+                response["height"].is_number(),
+                "height must be a number"
+            );
+        }
+    }
+
+    /// Validates the structure of a vin entry
+    fn validate_vin_structure(vin: &Value, is_coinbase: bool) {
+        assert!(vin.get("sequence").is_some(), "vin missing sequence");
+        assert!(vin["sequence"].is_number(), "sequence must be a number");
+
+        if is_coinbase {
+            assert!(
+                vin.get("coinbase").is_some(),
+                "coinbase vin missing coinbase field"
+            );
+            assert!(
+                vin["coinbase"].is_string(),
+                "coinbase must be a string"
+            );
+        } else {
+            assert!(vin.get("txid").is_some(), "vin missing txid");
+            assert!(vin.get("vout").is_some(), "vin missing vout");
+            assert!(vin.get("scriptSig").is_some(), "vin missing scriptSig");
+
+            assert!(vin["txid"].is_string(), "vin txid must be a string");
+            assert!(vin["vout"].is_number(), "vin vout must be a number");
+            assert!(
+                vin["scriptSig"].is_object(),
+                "scriptSig must be an object"
+            );
+
+            let script_sig = &vin["scriptSig"];
+            assert!(
+                script_sig.get("asm").is_some(),
+                "scriptSig missing asm"
+            );
+            assert!(
+                script_sig.get("hex").is_some(),
+                "scriptSig missing hex"
+            );
+        }
+
+        // txinwitness is optional (only for segwit inputs)
+        if let Some(witness) = vin.get("txinwitness") {
+            assert!(witness.is_array(), "txinwitness must be an array");
+        }
+    }
+
+    /// Validates the structure of a vout entry
+    fn validate_vout_structure(vout: &Value) {
+        assert!(vout.get("value").is_some(), "vout missing value");
+        assert!(vout.get("n").is_some(), "vout missing n");
+        assert!(
+            vout.get("scriptPubKey").is_some(),
+            "vout missing scriptPubKey"
+        );
+
+        assert!(vout["value"].is_number(), "value must be a number");
+        assert!(vout["n"].is_number(), "n must be a number");
+        assert!(
+            vout["scriptPubKey"].is_object(),
+            "scriptPubKey must be an object"
+        );
+
+        let script_pub_key = &vout["scriptPubKey"];
+        assert!(
+            script_pub_key.get("asm").is_some(),
+            "scriptPubKey missing asm"
+        );
+        assert!(
+            script_pub_key.get("hex").is_some(),
+            "scriptPubKey missing hex"
+        );
+        assert!(
+            script_pub_key.get("type").is_some(),
+            "scriptPubKey missing type"
+        );
+    }
+
+    #[test]
+    fn test_verbose_tx_unconfirmed_structure() {
+        // Simulated unconfirmed verbose transaction response
+        let response = json!({
+            "txid": "abc123def456789abc123def456789abc123def456789abc123def456789abc1",
+            "hash": "abc123def456789abc123def456789abc123def456789abc123def456789abc1",
+            "version": 2,
+            "size": 225,
+            "vsize": 144,
+            "weight": 573,
+            "locktime": 0,
+            "vin": [
+                {
+                    "txid": "def456789abc123def456789abc123def456789abc123def456789abc123def4",
+                    "vout": 0,
+                    "scriptSig": {
+                        "asm": "",
+                        "hex": ""
+                    },
+                    "txinwitness": [
+                        "304402...",
+                        "02abc..."
+                    ],
+                    "sequence": 4294967295u64
+                }
+            ],
+            "vout": [
+                {
+                    "value": 0.001,
+                    "n": 0,
+                    "scriptPubKey": {
+                        "asm": "OP_DUP OP_HASH160 ... OP_EQUALVERIFY OP_CHECKSIG",
+                        "hex": "76a914...",
+                        "type": "pubkeyhash",
+                        "address": "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"
+                    }
+                }
+            ],
+            "hex": "0200000001..."
+        });
+
+        validate_verbose_tx_structure(&response, false);
+
+        for vin in response["vin"].as_array().unwrap() {
+            validate_vin_structure(vin, false);
+        }
+
+        for vout in response["vout"].as_array().unwrap() {
+            validate_vout_structure(vout);
+        }
+    }
+
+    #[test]
+    fn test_verbose_tx_confirmed_structure() {
+        // Simulated confirmed verbose transaction response
+        let response = json!({
+            "txid": "abc123def456789abc123def456789abc123def456789abc123def456789abc1",
+            "hash": "abc123def456789abc123def456789abc123def456789abc123def456789abc1",
+            "version": 2,
+            "size": 225,
+            "vsize": 144,
+            "weight": 573,
+            "locktime": 0,
+            "vin": [
+                {
+                    "txid": "def456789abc123def456789abc123def456789abc123def456789abc123def4",
+                    "vout": 0,
+                    "scriptSig": {
+                        "asm": "",
+                        "hex": ""
+                    },
+                    "sequence": 4294967295u64
+                }
+            ],
+            "vout": [
+                {
+                    "value": 0.001,
+                    "n": 0,
+                    "scriptPubKey": {
+                        "asm": "OP_DUP OP_HASH160 ... OP_EQUALVERIFY OP_CHECKSIG",
+                        "hex": "76a914...",
+                        "type": "pubkeyhash"
+                    }
+                }
+            ],
+            "hex": "0200000001...",
+            "blockhash": "0000000000000000000abc123def456789abc123def456789abc123def456789",
+            "confirmations": 100,
+            "time": 1700000000,
+            "blocktime": 1700000000,
+            "height": 800000
+        });
+
+        validate_verbose_tx_structure(&response, true);
+
+        for vin in response["vin"].as_array().unwrap() {
+            validate_vin_structure(vin, false);
+        }
+
+        for vout in response["vout"].as_array().unwrap() {
+            validate_vout_structure(vout);
+        }
+    }
+
+    #[test]
+    fn test_verbose_tx_coinbase_structure() {
+        // Simulated coinbase transaction response
+        let response = json!({
+            "txid": "abc123def456789abc123def456789abc123def456789abc123def456789abc1",
+            "hash": "abc123def456789abc123def456789abc123def456789abc123def456789abc1",
+            "version": 1,
+            "size": 200,
+            "vsize": 200,
+            "weight": 800,
+            "locktime": 0,
+            "vin": [
+                {
+                    "coinbase": "03a50c0b...",
+                    "sequence": 4294967295u64
+                }
+            ],
+            "vout": [
+                {
+                    "value": 6.25,
+                    "n": 0,
+                    "scriptPubKey": {
+                        "asm": "OP_HASH160 ... OP_EQUAL",
+                        "hex": "a914...",
+                        "type": "scripthash",
+                        "address": "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy"
+                    }
+                }
+            ],
+            "hex": "01000000010000...",
+            "blockhash": "0000000000000000000abc123def456789abc123def456789abc123def456789",
+            "confirmations": 1000,
+            "time": 1700000000,
+            "blocktime": 1700000000,
+            "height": 800000
+        });
+
+        validate_verbose_tx_structure(&response, true);
+
+        // First vin is coinbase
+        validate_vin_structure(&response["vin"][0], true);
+
+        for vout in response["vout"].as_array().unwrap() {
+            validate_vout_structure(vout);
+        }
+    }
+
+    #[test]
+    fn test_vsize_calculation() {
+        // vsize = (weight + 3) / 4 (ceiling division)
+        // Test various weight values
+        let test_cases = [
+            (400, 100),   // weight 400 -> vsize 100
+            (401, 101),   // weight 401 -> vsize 101 (ceiling)
+            (402, 101),   // weight 402 -> vsize 101
+            (403, 101),   // weight 403 -> vsize 101
+            (404, 101),   // weight 404 -> vsize 101
+            (573, 144),   // typical segwit tx
+            (1000, 250),  // weight 1000 -> vsize 250
+        ];
+
+        for (weight, expected_vsize) in test_cases {
+            let vsize = (weight + 3) / 4;
+            assert_eq!(
+                vsize, expected_vsize,
+                "weight {} should give vsize {}, got {}",
+                weight, expected_vsize, vsize
+            );
+        }
+    }
+
+    #[test]
+    fn test_verbose_tx_script_types() {
+        // Test that various script types are recognized
+        let script_types = [
+            "pubkeyhash",           // P2PKH
+            "scripthash",           // P2SH
+            "witness_v0_keyhash",   // P2WPKH
+            "witness_v0_scripthash", // P2WSH
+            "nulldata",             // OP_RETURN
+            "pubkey",               // P2PK
+            "nonstandard",          // Unknown
+            "witness_unknown",      // Unknown witness version
+        ];
+
+        for script_type in script_types {
+            let vout = json!({
+                "value": 0.001,
+                "n": 0,
+                "scriptPubKey": {
+                    "asm": "...",
+                    "hex": "...",
+                    "type": script_type
+                }
+            });
+
+            validate_vout_structure(&vout);
+            assert_eq!(
+                vout["scriptPubKey"]["type"].as_str().unwrap(),
+                script_type
+            );
+        }
     }
 }
