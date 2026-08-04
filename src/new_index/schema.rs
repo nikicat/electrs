@@ -317,6 +317,10 @@ pub struct Indexer {
     // restart, sweeps sparse ranges during recovery), rate() over this
     // counter is a clean throughput signal.
     blocks_indexed: Counter,
+    // prevout-cache effectiveness, for dashboards: windowed hit rate =
+    // rate(hits) / rate(lookups)
+    cache_hits: Counter,
+    cache_lookups: Counter,
     sync_height: Gauge,
     sync_progress: prometheus::Gauge,
 }
@@ -370,6 +374,14 @@ impl Indexer {
             blocks_indexed: metrics.counter(MetricOpts::new(
                 "blocks_indexed_total",
                 "Total number of blocks indexed into the history db",
+            )),
+            cache_hits: metrics.counter(MetricOpts::new(
+                "prevout_cache_hits_total",
+                "Prevout lookups served from the in-memory cache",
+            )),
+            cache_lookups: metrics.counter(MetricOpts::new(
+                "prevout_cache_lookups_total",
+                "Total prevout lookups (cache hits + txstore lookups)",
             )),
             sync_height: metrics.gauge(MetricOpts::new(
                 "initial_sync_height",
@@ -750,6 +762,8 @@ impl Indexer {
                 });
                 cache.log_stats(cached.len(), outpoints.len());
             }
+            self.cache_hits.inc_by(cached.len() as u64);
+            self.cache_lookups.inc_by((cached.len() + outpoints.len()) as u64);
             let mut txos = lookup_txos_partial(&self.store.txstore_db, outpoints);
             txos.found.extend(cached);
             txos
