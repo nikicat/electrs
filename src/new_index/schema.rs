@@ -357,8 +357,14 @@ impl Indexer {
 
             // Fetch the reorged blocks, then undo their history index db rows.
             // The txstore db rows are kept for reorged blocks/transactions.
-            start_fetcher(self.from, &daemon, reorged_headers, self.iconfig.block_batch_size, chain_tip_height)?
-                .map(|blocks| self.undo_index(&blocks));
+            start_fetcher(
+                self.from,
+                &daemon,
+                reorged_headers,
+                self.iconfig.block_batch_size,
+                chain_tip_height,
+            )?
+            .map(|blocks| self.undo_index(&blocks));
         }
 
         // Single-pass: add to txstore and index to history in the same per-batch loop.
@@ -384,8 +390,19 @@ impl Indexer {
 
         let mut fetcher_count = 0;
         let to_process_total = to_process.len();
+        // Blocks deferred by index() because a prevout's funding block was not
+        // added yet (out-of-order blk*.dat delivery). Bounded in practice by
+        // bitcoind's ~1024-block download window; retried on every batch.
+        let mut deferred: Vec<BlockEntry> = Vec::new();
 
-        start_fetcher(self.from, &daemon, to_process, self.iconfig.block_batch_size, chain_tip_height)?.map(|blocks| {
+        start_fetcher(
+            self.from,
+            &daemon,
+            to_process,
+            self.iconfig.block_batch_size,
+            chain_tip_height,
+        )?
+        .map(|blocks| {
             if fetcher_count % 25 == 0 && to_process_total > 20 {
                 let batch_height = blocks.last().map(|b| b.entry.height()).unwrap_or(0);
                 info!(
@@ -417,23 +434,49 @@ impl Indexer {
                     .collect()
             };
 
-            if !to_add.is_empty() || !to_index.is_empty() {
+            if !to_add.is_empty() || !to_index.is_empty() || !deferred.is_empty() {
                 let _batch_timer = self.start_timer("batch_total");
                 if !to_add.is_empty() {
                     self.add(&to_add);
                 }
+                // Retry deferred blocks first — their funding blocks may have
+                // just been added — then index the current batch.
+                if !deferred.is_empty() {
+                    let retry = std::mem::take(&mut deferred);
+                    deferred = self.index(&retry);
+                }
                 if !to_index.is_empty() {
-                    self.index(&to_index);
+                    deferred.extend(self.index(&to_index));
                 }
             }
             if let Some(last) = blocks.last() {
                 let h = last.entry.height();
                 self.sync_height.set(h as i64);
                 if chain_tip_height > 0 {
-                    self.sync_progress.set(h as f64 / chain_tip_height as f64 * 100.0);
+                    self.sync_progress
+                        .set(h as f64 / chain_tip_height as f64 * 100.0);
                 }
             }
         });
+
+        // Drain any still-deferred blocks. Every funding block has been added
+        // by now, so one round must resolve them all; no progress means the
+        // datadir is genuinely missing transactions. This must complete before
+        // the synced tip is written below: neither Store::open's tip-walk nor
+        // get_new_headers can rediscover an unindexed gap beneath a written tip.
+        while !deferred.is_empty() {
+            let retry = std::mem::take(&mut deferred);
+            let retry_len = retry.len();
+            info!("retrying {} deferred out-of-order blocks", retry_len);
+            deferred = self.index(&retry);
+            if deferred.len() == retry_len {
+                panic!(
+                    "datadir corrupt — missing prevouts for {} blocks (first: {})",
+                    deferred.len(),
+                    deferred[0].entry.hash()
+                );
+            }
+        }
 
         // Compact after all add+index work is done, not between passes.
         self.start_auto_compactions(&self.store.txstore_db);
@@ -462,6 +505,7 @@ impl Indexer {
         }
 
         // Update the synced tip after all db writes are flushed
+        debug_assert!(deferred.is_empty()); // a gap beneath the tip would be unrecoverable
         debug!("updating synced tip to {:?}", tip);
         self.store.txstore_db.put_sync(b"t", &serialize(&tip));
 
@@ -498,10 +542,59 @@ impl Indexer {
             .extend(blocks.iter().map(|b| b.entry.hash()));
     }
 
-    fn index(&self, blocks: &[BlockEntry]) {
-        self.store
-            .history_db
-            .write_rows(self._index(blocks), self.flush);
+    // Index the given blocks into the history db, deferring any block that
+    // spends an output whose funding transaction is not in the txstore yet —
+    // possible during initial sync because blk*.dat files hold blocks in
+    // arrival order, not height order (see issue #214). Returns the deferred
+    // blocks; the caller must retry them (after more blocks were added) and
+    // ensure none remain before the synced tip is committed.
+    fn index(&self, blocks: &[BlockEntry]) -> Vec<BlockEntry> {
+        let txos = {
+            let _timer = self.start_timer("index_lookup");
+            lookup_txos_partial(&self.store.txstore_db, get_previous_txos(blocks))
+        };
+
+        if txos.missing.is_empty() {
+            self.write_history(blocks, &txos.found);
+            return vec![];
+        }
+
+        // A block is only indexable if every prevout it spends resolved;
+        // index_transaction panics on a partial map. Defer whole blocks.
+        let (ready, deferred): (Vec<BlockEntry>, Vec<BlockEntry>) =
+            blocks.iter().cloned().partition(|b| {
+                b.block.txdata.iter().all(|tx| {
+                    tx.input
+                        .iter()
+                        .filter(|txin| has_prevout(txin))
+                        .all(|txin| !txos.missing.contains(&txin.previous_output))
+                })
+            });
+        info!(
+            "deferred {} out-of-order blocks ({} unresolved prevouts)",
+            deferred.len(),
+            txos.missing.len()
+        );
+        if !ready.is_empty() {
+            self.write_history(&ready, &txos.found);
+        }
+        deferred
+    }
+
+    fn write_history(&self, blocks: &[BlockEntry], previous_txos_map: &HashMap<OutPoint, TxOut>) {
+        let rows = {
+            let _timer = self.start_timer("index_process");
+            let added_blockhashes = self.store.added_blockhashes.read().unwrap();
+            for b in blocks {
+                let blockhash = b.entry.hash();
+                // TODO: replace by lookup into txstore_db?
+                if !added_blockhashes.contains(blockhash) {
+                    panic!("cannot index block {} (missing from store)", blockhash);
+                }
+            }
+            index_blocks(blocks, previous_txos_map, &self.iconfig)
+        };
+        self.store.history_db.write_rows(rows, self.flush);
 
         let mut indexed_blockhashes = self.store.indexed_blockhashes.write().unwrap();
         indexed_blockhashes.extend(blocks.iter().map(|b| b.entry.hash()));
