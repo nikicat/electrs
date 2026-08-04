@@ -57,6 +57,13 @@ pub struct Config {
     /// files need ~625 MB of filter blocks on top of index blocks.
     pub db_block_cache_mb: usize,
 
+    /// In-memory prevout cache budget in MB for initial sync (0 = disabled).
+    /// Caches recently-created spendable TxOuts so index() can resolve most
+    /// spends without touching the txstore DB; entries are removed on hit
+    /// (an output is spent at most once), missing entries fall back to the
+    /// regular txstore lookup, so any eviction is safe.
+    pub prevout_cache_mb: usize,
+
     /// RocksDB parallelism level (background compaction and flush threads)
     /// Recommendation: Set to number of CPU cores for optimal performance
     /// This configures max_background_jobs and thread pools automatically
@@ -267,6 +274,12 @@ impl Config {
                     .help("RocksDB block cache size in MB (shared across all databases). Bounds index/filter block memory; use 4096+ for initial sync to avoid table-reader heap growth.")
                     .takes_value(true)
                     .default_value("24")
+            ).arg(
+                Arg::with_name("prevout_cache_mb")
+                    .long("prevout-cache-mb")
+                    .help("In-memory prevout cache budget in MB for initial sync (0 = disabled). Serves spends of recently-created outputs without txstore reads; misses fall back to the DB.")
+                    .takes_value(true)
+                    .default_value("0")
             ).arg(
                 Arg::with_name("db_parallelism")
                     .long("db-parallelism")
@@ -541,6 +554,7 @@ impl Config {
             cors: m.value_of("cors").map(|s| s.to_string()),
             precache_scripts: m.value_of("precache_scripts").map(|s| s.to_string()),
             db_block_cache_mb: value_t_or_exit!(m, "db_block_cache_mb", usize),
+            prevout_cache_mb: value_t_or_exit!(m, "prevout_cache_mb", usize),
             db_parallelism: value_t_or_exit!(m, "db_parallelism", usize),
             db_write_buffer_size_mb: value_t_or_exit!(m, "db_write_buffer_size_mb", usize),
             initial_sync_batch_size: value_t_or_exit!(m, "initial_sync_batch_size", usize),

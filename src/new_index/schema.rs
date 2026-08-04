@@ -17,7 +17,7 @@ use elements::{
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::convert::TryInto;
-use std::sync::{Arc, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 
 use crate::{chain::{
     BlockHash, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid, Value,
@@ -219,11 +219,97 @@ impl ScriptStats {
     }
 }
 
+// In-memory cache of recently-created spendable TxOuts, used during initial
+// sync to resolve spends without reading the txstore DB. Correctness never
+// depends on it: a miss falls back to lookup_txos_partial, so entries may be
+// dropped freely. Two properties keep it small and effective:
+//  - a hit removes the entry (a valid chain spends an output at most once),
+//    so the cache self-prunes toward the live UTXO set of the scan position;
+//  - inserts rotate two generations FIFO-style under a byte budget, evicting
+//    the older generation wholesale (spend probability decays fast with age).
+// Sub-1000-sat outputs are not cached: they are numerous (dust, inscription
+// postage) and rarely economical to spend, so they cost budget at near-zero
+// hit-rate benefit.
+struct PrevoutCache {
+    young: HashMap<OutPoint, TxOut>,
+    old: HashMap<OutPoint, TxOut>,
+    young_bytes: usize,
+    generation_budget: usize, // half the configured total
+    hits: u64,
+    lookups: u64,
+    calls: u64,
+}
+
+#[cfg(not(feature = "liquid"))]
+const PREVOUT_CACHE_MIN_SATS: u64 = 1000;
+// rough per-entry footprint: 36-byte outpoint + amount + script vec + hashmap overhead
+const PREVOUT_CACHE_ENTRY_OVERHEAD: usize = 100;
+
+impl PrevoutCache {
+    fn new(budget_mb: usize) -> Self {
+        PrevoutCache {
+            young: HashMap::new(),
+            old: HashMap::new(),
+            young_bytes: 0,
+            generation_budget: budget_mb * 1024 * 1024 / 2,
+            hits: 0,
+            lookups: 0,
+            calls: 0,
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.generation_budget > 0
+    }
+
+    fn insert(&mut self, outpoint: OutPoint, txo: TxOut) {
+        if !self.enabled() {
+            return;
+        }
+        #[cfg(not(feature = "liquid"))]
+        if txo.value.to_sat() < PREVOUT_CACHE_MIN_SATS {
+            return;
+        }
+        let size = PREVOUT_CACHE_ENTRY_OVERHEAD + txo.script_pubkey.len();
+        if self.young_bytes + size > self.generation_budget {
+            self.old = std::mem::take(&mut self.young);
+            self.young_bytes = 0;
+        }
+        self.young_bytes += size;
+        self.young.insert(outpoint, txo);
+    }
+
+    // A hit surrenders ownership: a valid chain spends an output at most once,
+    // so the entry can never be needed again.
+    fn take(&mut self, outpoint: &OutPoint) -> Option<TxOut> {
+        self.young
+            .remove(outpoint)
+            .or_else(|| self.old.remove(outpoint))
+    }
+
+    fn log_stats(&mut self, hits: usize, misses: usize) {
+        self.hits += hits as u64;
+        self.lookups += (hits + misses) as u64;
+        self.calls += 1;
+        if self.calls % 50 == 0 && self.lookups > 0 {
+            info!(
+                "prevout cache: {:.1}% hit rate ({}/{} lookups), {}+{} entries",
+                self.hits as f64 / self.lookups as f64 * 100.0,
+                self.hits,
+                self.lookups,
+                self.young.len(),
+                self.old.len(),
+            );
+        }
+    }
+}
+
 pub struct Indexer {
     store: Arc<Store>,
     flush: DBFlush,
     from: FetchFrom,
     iconfig: IndexerConfig,
+    prevout_cache: Mutex<PrevoutCache>,
     duration: HistogramVec,
     tip_metric: Gauge,
     sync_height: Gauge,
@@ -270,6 +356,7 @@ impl Indexer {
             flush: DBFlush::Disable,
             from,
             iconfig: IndexerConfig::from(config),
+            prevout_cache: Mutex::new(PrevoutCache::new(config.prevout_cache_mb)),
             duration: metrics.histogram_vec(
                 HistogramOpts::new("index_duration", "Index update duration (in seconds)"),
                 &["step"],
@@ -567,6 +654,12 @@ impl Indexer {
             info!("flushing cache_db complete in {:.1?}", t.elapsed());
 
             self.flush = DBFlush::Enable;
+
+            // Initial sync is over: from here the cache would only see a
+            // trickle of tip blocks. Drop it and free its memory (misses
+            // fall back to the txstore lookup, so this is purely a memory
+            // release, not a behavior change).
+            *self.prevout_cache.lock().unwrap() = PrevoutCache::new(0);
         }
 
         // Update the synced tip after all db writes are flushed
@@ -602,6 +695,28 @@ impl Indexer {
             .write()
             .unwrap()
             .extend(blocks.iter().map(|b| b.entry.hash()));
+
+        // Feed this batch's spendable outputs to the prevout cache so later
+        // spends resolve without a txstore read. Txids were already computed
+        // by the fetcher (b.txids).
+        let mut cache = self.prevout_cache.lock().unwrap();
+        if cache.enabled() {
+            for b in blocks {
+                for (tx, txid) in b.block.txdata.iter().zip(b.txids.iter()) {
+                    for (vout, txo) in tx.output.iter().enumerate() {
+                        if is_spendable(txo) {
+                            cache.insert(
+                                OutPoint {
+                                    txid: *txid,
+                                    vout: vout as u32,
+                                },
+                                txo.clone(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Index the given blocks into the history db, deferring any block that
@@ -613,7 +728,22 @@ impl Indexer {
     fn index(&self, blocks: &[BlockEntry]) -> Vec<BlockEntry> {
         let txos = {
             let _timer = self.start_timer("index_lookup");
-            lookup_txos_partial(&self.store.txstore_db, get_previous_txos(blocks))
+            let mut outpoints = get_previous_txos(blocks);
+            let mut cached = HashMap::new();
+            {
+                let mut cache = self.prevout_cache.lock().unwrap();
+                outpoints.retain(|outpoint| match cache.take(outpoint) {
+                    Some(txo) => {
+                        cached.insert(*outpoint, txo);
+                        false
+                    }
+                    None => true,
+                });
+                cache.log_stats(cached.len(), outpoints.len());
+            }
+            let mut txos = lookup_txos_partial(&self.store.txstore_db, outpoints);
+            txos.found.extend(cached);
+            txos
         };
 
         if txos.missing.is_empty() {
@@ -2339,6 +2469,7 @@ mod tests {
                 rpc_logging: crate::config::RpcLogging::default(),
                 zmq_addr: None,
                 db_block_cache_mb: 8,
+                prevout_cache_mb: 4,
                 db_parallelism: 2,
                 db_write_buffer_size_mb: 16,
                 initial_sync_batch_size: 250,
