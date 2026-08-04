@@ -1404,19 +1404,17 @@ fn get_previous_txos(block_entries: &[BlockEntry]) -> BTreeSet<OutPoint> {
 }
 
 fn lookup_txos(txstore_db: &DB, outpoints: BTreeSet<OutPoint>) -> Result<HashMap<OutPoint, TxOut>> {
-    let keys = outpoints.iter().map(TxOutRow::key).collect::<Vec<_>>();
-    txstore_db
-        .multi_get(keys)
-        .into_iter()
-        .zip(outpoints)
-        .map(|(res, outpoint)| {
-            let txo = res
-                .unwrap()
-                .ok_or_else(|| format!("missing txo {}", outpoint))?;
-            Ok((outpoint, deserialize(&txo).expect("failed to parse TxOut")))
-        })
-        .collect()
+    let PartialTxos { found, missing } = lookup_txos_partial(txstore_db, outpoints);
+    match missing.iter().next() {
+        None => Ok(found),
+        Some(outpoint) => Err(format!("missing txo {}", outpoint).into()),
+    }
 }
+
+// Point lookups are latency-bound: one serial multi_get leaves the disk's queue
+// depth unused. Sharding across rayon lets lookups overlap; chunks are large
+// enough that each multi_get still amortizes its per-call overhead.
+const LOOKUP_TXOS_CHUNK: usize = 512;
 
 // Result of a tolerant prevout lookup: the outpoints that resolved, and the
 // ones with no `O` row in the txstore.
@@ -1432,20 +1430,36 @@ struct PartialTxos {
 // written (see TxOutRow) but also never spent in a valid chain. Database
 // errors still panic, exactly like lookup_txos.
 fn lookup_txos_partial(txstore_db: &DB, outpoints: BTreeSet<OutPoint>) -> PartialTxos {
-    let keys = outpoints.iter().map(TxOutRow::key).collect::<Vec<_>>();
-    let mut found = HashMap::new();
-    let mut missing = BTreeSet::new();
-    for (res, outpoint) in txstore_db.multi_get(keys).into_iter().zip(outpoints) {
-        match res.unwrap() {
-            Some(val) => {
-                found.insert(outpoint, deserialize(&val).expect("failed to parse TxOut"));
+    let outpoints = outpoints.into_iter().collect::<Vec<_>>();
+    outpoints
+        .par_chunks(LOOKUP_TXOS_CHUNK)
+        .map(|chunk| {
+            let keys = chunk.iter().map(TxOutRow::key).collect::<Vec<_>>();
+            let mut found = HashMap::new();
+            let mut missing = BTreeSet::new();
+            for (res, outpoint) in txstore_db.multi_get(keys).into_iter().zip(chunk) {
+                match res.unwrap() {
+                    Some(val) => {
+                        found.insert(*outpoint, deserialize(&val).expect("failed to parse TxOut"));
+                    }
+                    None => {
+                        missing.insert(*outpoint);
+                    }
+                }
             }
-            None => {
-                missing.insert(outpoint);
-            }
-        }
-    }
-    PartialTxos { found, missing }
+            PartialTxos { found, missing }
+        })
+        .reduce(
+            || PartialTxos {
+                found: HashMap::new(),
+                missing: BTreeSet::new(),
+            },
+            |mut acc, part| {
+                acc.found.extend(part.found);
+                acc.missing.extend(part.missing);
+                acc
+            },
+        )
 }
 
 fn lookup_txo(txstore_db: &DB, outpoint: &OutPoint) -> Option<TxOut> {
