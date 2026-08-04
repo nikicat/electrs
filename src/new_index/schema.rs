@@ -329,59 +329,87 @@ impl Indexer {
 
         // Handle reorgs by undoing the reorged (stale) blocks first
         if let Some(reorged_since) = reorged_since {
-            // Remove reorged headers from the in-memory HeaderList.
-            // This will also immediately invalidate all the history db entries originating from those blocks
-            // (even before the rows are deleted below), since they reference block heights that will no longer exist.
-            // This ensures consistency - it is not possible for blocks to be available (e.g. in GET /blocks/tip or /block/:hash)
-            // without the corresponding history entries for these blocks (e.g. in GET /address/:address/txs), or vice-versa.
-            let mut reorged_headers = self
-                .store
-                .indexed_headers
-                .write()
-                .unwrap()
-                .pop(reorged_since);
-            // The chain tip will temporarily drop to the common ancestor (at height reorged_since-1),
-            // until the new headers are `append()`ed (below).
-
-            info!(
-                "processing reorg of depth {} since height {}",
-                reorged_headers.len(),
-                reorged_since,
-            );
-
-            // Reorged blocks are undone in chunks of 100, processed in serial, each as an atomic batch.
-            // Reverse them so that chunks closest to the chain tip are processed first,
-            // which is necessary to properly recover from crashes during reorg handling.
-            // Also see the comment under `Store::open()`.
-            reorged_headers.reverse();
-
-            // Fetch the reorged blocks, then undo their history index db rows.
-            // The txstore db rows are kept for reorged blocks/transactions.
-            start_fetcher(
-                self.from,
-                &daemon,
-                reorged_headers,
-                self.iconfig.block_batch_size,
-                chain_tip_height,
-            )?
-            .map(|blocks| self.undo_index(&blocks));
+            self.undo_reorged(&daemon, reorged_since, chain_tip_height)?;
         }
 
-        // Single-pass: add to txstore and index to history in the same per-batch loop.
-        //
-        // In the old two-pass approach, txstore_db was fully compacted between the add
-        // and index passes, which pushed all O rows into large SST files deep in the LSM
-        // tree. With only a small block cache, lookup_txos() during indexing then caused
-        // nearly every key to require a disk read.
-        //
-        // By interleaving add() and index() in the same batch, the O rows written by
-        // add() are still in the write buffer (or nearby L0 SST files) when index()
-        // calls lookup_txos() — dramatically increasing cache hit rate.
-        //
-        // Crash safety: added_blockhashes / indexed_blockhashes are persisted via the
-        // "D" done-marker rows. On restart, headers_to_process() re-derives which
-        // blocks still need work, so partially-processed batches are re-processed safely.
-        let to_process = self.headers_to_process(&new_headers);
+        let deferred = self.process_new_blocks(&daemon, &new_headers, chain_tip_height)?;
+        self.drain_deferred(deferred);
+        self.finish_sync(&tip, new_headers);
+
+        Ok(tip)
+    }
+
+    // Undo the history rows of reorged (stale) blocks, so the new best chain
+    // can be indexed in their place.
+    fn undo_reorged(
+        &self,
+        daemon: &Daemon,
+        reorged_since: usize,
+        chain_tip_height: usize,
+    ) -> Result<()> {
+        // Remove reorged headers from the in-memory HeaderList.
+        // This will also immediately invalidate all the history db entries originating from those blocks
+        // (even before the rows are deleted below), since they reference block heights that will no longer exist.
+        // This ensures consistency - it is not possible for blocks to be available (e.g. in GET /blocks/tip or /block/:hash)
+        // without the corresponding history entries for these blocks (e.g. in GET /address/:address/txs), or vice-versa.
+        let mut reorged_headers = self
+            .store
+            .indexed_headers
+            .write()
+            .unwrap()
+            .pop(reorged_since);
+        // The chain tip will temporarily drop to the common ancestor (at height reorged_since-1),
+        // until the new headers are `append()`ed (in finish_sync).
+
+        info!(
+            "processing reorg of depth {} since height {}",
+            reorged_headers.len(),
+            reorged_since,
+        );
+
+        // Reorged blocks are undone in chunks of 100, processed in serial, each as an atomic batch.
+        // Reverse them so that chunks closest to the chain tip are processed first,
+        // which is necessary to properly recover from crashes during reorg handling.
+        // Also see the comment under `Store::open()`.
+        reorged_headers.reverse();
+
+        // Fetch the reorged blocks, then undo their history index db rows.
+        // The txstore db rows are kept for reorged blocks/transactions.
+        start_fetcher(
+            self.from,
+            daemon,
+            reorged_headers,
+            self.iconfig.block_batch_size,
+            chain_tip_height,
+        )?
+        .map(|blocks| self.undo_index(&blocks));
+        Ok(())
+    }
+
+    // Single-pass: add to txstore and index to history in the same per-batch loop.
+    //
+    // In the old two-pass approach, txstore_db was fully compacted between the add
+    // and index passes, which pushed all O rows into large SST files deep in the LSM
+    // tree. With only a small block cache, lookup_txos() during indexing then caused
+    // nearly every key to require a disk read.
+    //
+    // By interleaving add() and index() in the same batch, the O rows written by
+    // add() are still in the write buffer (or nearby L0 SST files) when index()
+    // calls lookup_txos() — dramatically increasing cache hit rate.
+    //
+    // Crash safety: added_blockhashes / indexed_blockhashes are persisted via the
+    // "D" done-marker rows. On restart, headers_to_process() re-derives which
+    // blocks still need work, so partially-processed batches are re-processed safely.
+    //
+    // Returns the blocks still deferred after the last batch (see index());
+    // the caller must drain them before the synced tip is written.
+    fn process_new_blocks(
+        &self,
+        daemon: &Daemon,
+        new_headers: &[HeaderEntry],
+        chain_tip_height: usize,
+    ) -> Result<Vec<BlockEntry>> {
+        let to_process = self.headers_to_process(new_headers);
         debug!(
             "processing {} blocks (add + index) using {:?}",
             to_process.len(),
@@ -397,7 +425,7 @@ impl Indexer {
 
         start_fetcher(
             self.from,
-            &daemon,
+            daemon,
             to_process,
             self.iconfig.block_batch_size,
             chain_tip_height,
@@ -414,41 +442,8 @@ impl Indexer {
             }
             fetcher_count += 1;
 
-            // Add blocks not yet in txstore (idempotent: crash recovery skips already-added blocks)
-            let to_add: Vec<_> = {
-                let added = self.store.added_blockhashes.read().unwrap();
-                blocks
-                    .iter()
-                    .filter(|b| !added.contains(b.entry.hash()))
-                    .cloned()
-                    .collect()
-            };
+            self.process_batch(&blocks, &mut deferred);
 
-            // Index blocks not yet in history (O rows for to_add are now in the write buffer)
-            let to_index: Vec<_> = {
-                let indexed = self.store.indexed_blockhashes.read().unwrap();
-                blocks
-                    .iter()
-                    .filter(|b| !indexed.contains(b.entry.hash()))
-                    .cloned()
-                    .collect()
-            };
-
-            if !to_add.is_empty() || !to_index.is_empty() || !deferred.is_empty() {
-                let _batch_timer = self.start_timer("batch_total");
-                if !to_add.is_empty() {
-                    self.add(&to_add);
-                }
-                // Retry deferred blocks first — their funding blocks may have
-                // just been added — then index the current batch.
-                if !deferred.is_empty() {
-                    let retry = std::mem::take(&mut deferred);
-                    deferred = self.index(&retry);
-                }
-                if !to_index.is_empty() {
-                    deferred.extend(self.index(&to_index));
-                }
-            }
             if let Some(last) = blocks.last() {
                 let h = last.entry.height();
                 self.sync_height.set(h as i64);
@@ -459,16 +454,59 @@ impl Indexer {
             }
         });
 
-        // Drain any still-deferred blocks. Every funding block has been added
-        // by now, so one round must resolve them all; no progress means the
-        // datadir is genuinely missing transactions. This must complete before
-        // the synced tip is written below: neither Store::open's tip-walk nor
-        // get_new_headers can rediscover an unindexed gap beneath a written tip.
+        Ok(deferred)
+    }
+
+    // Add and index one fetched batch, retrying previously deferred blocks.
+    fn process_batch(&self, blocks: &[BlockEntry], deferred: &mut Vec<BlockEntry>) {
+        // Add blocks not yet in txstore (idempotent: crash recovery skips already-added blocks)
+        let to_add: Vec<_> = {
+            let added = self.store.added_blockhashes.read().unwrap();
+            blocks
+                .iter()
+                .filter(|b| !added.contains(b.entry.hash()))
+                .cloned()
+                .collect()
+        };
+
+        // Index blocks not yet in history (O rows for to_add are now in the write buffer)
+        let to_index: Vec<_> = {
+            let indexed = self.store.indexed_blockhashes.read().unwrap();
+            blocks
+                .iter()
+                .filter(|b| !indexed.contains(b.entry.hash()))
+                .cloned()
+                .collect()
+        };
+
+        if to_add.is_empty() && to_index.is_empty() && deferred.is_empty() {
+            return;
+        }
+        let _batch_timer = self.start_timer("batch_total");
+        if !to_add.is_empty() {
+            self.add(&to_add);
+        }
+        // Retry deferred blocks first — their funding blocks may have
+        // just been added — then index the current batch.
+        if !deferred.is_empty() {
+            let retry = std::mem::take(deferred);
+            *deferred = self.index(&retry);
+        }
+        if !to_index.is_empty() {
+            deferred.extend(self.index(&to_index));
+        }
+    }
+
+    // Drain any still-deferred blocks. Every funding block has been added by
+    // now, so one round must resolve them all; no progress means the datadir
+    // is genuinely missing transactions. This must complete before the synced
+    // tip is written (in finish_sync): neither Store::open's tip-walk nor
+    // get_new_headers can rediscover an unindexed gap beneath a written tip.
+    fn drain_deferred(&self, mut deferred: Vec<BlockEntry>) {
         while !deferred.is_empty() {
-            let retry = std::mem::take(&mut deferred);
-            let retry_len = retry.len();
+            let retry_len = deferred.len();
             info!("retrying {} deferred out-of-order blocks", retry_len);
-            deferred = self.index(&retry);
+            deferred = self.index(&deferred);
             if deferred.len() == retry_len {
                 panic!(
                     "datadir corrupt — missing prevouts for {} blocks (first: {})",
@@ -477,7 +515,13 @@ impl Indexer {
                 );
             }
         }
+    }
 
+    // Compact, flush, persist the synced tip and publish the new headers.
+    // Must only run once every new header's block is indexed (drain_deferred
+    // loops until that holds or panics) — a gap beneath a written tip would
+    // be unrecoverable.
+    fn finish_sync(&mut self, tip: &BlockHash, new_headers: Vec<HeaderEntry>) {
         // Compact after all add+index work is done, not between passes.
         self.start_auto_compactions(&self.store.txstore_db);
         self.start_auto_compactions(&self.store.history_db);
@@ -505,23 +549,20 @@ impl Indexer {
         }
 
         // Update the synced tip after all db writes are flushed
-        debug_assert!(deferred.is_empty()); // a gap beneath the tip would be unrecoverable
         debug!("updating synced tip to {:?}", tip);
-        self.store.txstore_db.put_sync(b"t", &serialize(&tip));
+        self.store.txstore_db.put_sync(b"t", &serialize(tip));
 
         // Finally, append the new headers to the in-memory HeaderList.
         // This will make both the headers and the history entries visible in the public APIs, consistently with each-other.
         let mut headers = self.store.indexed_headers.write().unwrap();
         headers.append(new_headers);
-        assert_eq!(tip, *headers.tip());
+        assert_eq!(*tip, *headers.tip());
 
         if let FetchFrom::BlkFiles = self.from {
             self.from = FetchFrom::Bitcoind;
         }
 
         self.tip_metric.set(headers.best_height() as i64);
-
-        Ok(tip)
     }
 
     fn add(&self, blocks: &[BlockEntry]) {
