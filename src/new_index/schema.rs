@@ -2157,4 +2157,170 @@ mod tests {
                 .unwrap();
         assert_eq!(sha256::Hash::hash(b"abc"), expected);
     }
+
+    // Regression test for issue #214: blk*.dat files deliver blocks in arrival
+    // order, so a block spending an output can reach the indexer before the
+    // block funding it was added. index() must defer such blocks instead of
+    // panicking, and a retry after the funding block is added must produce a
+    // history db identical to in-order processing.
+    #[cfg(not(feature = "liquid"))]
+    mod out_of_order {
+        use super::super::*;
+        use crate::chain::{Block, BlockHash, Sequence, TxIn, TxMerkleNode};
+
+        fn p2pkh(hash_byte: u8) -> Script {
+            let mut script =
+                Vec::from_hex("76a91462e907b15cbf27d5425399ebf6f0fb50ebb88f1888ac").unwrap();
+            script[3] = hash_byte;
+            script.into()
+        }
+
+        fn coinbase(tag: u8) -> Transaction {
+            Transaction {
+                version: bitcoin::transaction::Version::ONE,
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: vec![tag].into(),
+                    sequence: Sequence::MAX,
+                    witness: Default::default(),
+                }],
+                output: vec![TxOut {
+                    value: bitcoin::Amount::from_sat(50_0000_0000),
+                    script_pubkey: p2pkh(tag),
+                }],
+            }
+        }
+
+        fn block_entry(height: usize, prev: BlockHash, txdata: Vec<Transaction>) -> BlockEntry {
+            let header = BlockHeader {
+                version: bitcoin::block::Version::ONE,
+                prev_blockhash: prev,
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: height as u32,
+                bits: bitcoin::CompactTarget::from_consensus(0x207fffff),
+                nonce: 0,
+            };
+            let block = Block { header, txdata };
+            BlockEntry {
+                txids: block.txdata.iter().map(|tx| tx.compute_txid()).collect(),
+                entry: HeaderEntry::new(height, block.block_hash(), block.header),
+                size: 0,
+                block,
+            }
+        }
+
+        // Block A funds; block B spends A's coinbase output.
+        fn dependent_blocks() -> (BlockEntry, BlockEntry) {
+            let cb_a = coinbase(1);
+            let spend = Transaction {
+                version: bitcoin::transaction::Version::ONE,
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::new(cb_a.compute_txid(), 0),
+                    script_sig: Script::new(),
+                    sequence: Sequence::MAX,
+                    witness: Default::default(),
+                }],
+                output: vec![TxOut {
+                    value: bitcoin::Amount::from_sat(49_0000_0000),
+                    script_pubkey: p2pkh(3),
+                }],
+            };
+            let a = block_entry(1, BlockHash::all_zeros(), vec![cb_a]);
+            let b = block_entry(2, a.entry.hash().clone(), vec![coinbase(2), spend]);
+            (a, b)
+        }
+
+        fn test_indexer() -> (Indexer, tempfile::TempDir) {
+            let tmp = tempfile::tempdir().unwrap();
+            let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let config = Config {
+                log: stderrlog::new().clone(),
+                network_type: Network::Regtest,
+                db_path: tmp.path().to_path_buf(),
+                daemon_dir: tmp.path().to_path_buf(),
+                daemon_parallelism: 1,
+                daemon_conn_max_age: None,
+                blocks_dir: tmp.path().to_path_buf(),
+                daemon_rpc_addr: addr,
+                daemon_rpc_fallback_addr: None,
+                cookie: None,
+                electrum_rpc_addr: addr,
+                http_addr: addr,
+                http_socket_file: None,
+                monitoring_addr: addr,
+                jsonrpc_import: false,
+                light_mode: false,
+                address_search: false,
+                index_unspendables: false,
+                enable_mining_rest: false,
+                cors: None,
+                precache_scripts: None,
+                utxos_limit: 100,
+                electrum_txs_limit: 100,
+                electrum_banner: "".into(),
+                rpc_logging: crate::config::RpcLogging::default(),
+                zmq_addr: None,
+                db_block_cache_mb: 8,
+                db_parallelism: 2,
+                db_write_buffer_size_mb: 16,
+                initial_sync_batch_size: 250,
+                db_cache_index_filter_blocks: false,
+            };
+            let metrics = Metrics::new(addr); // never started — no bind
+            let store = Arc::new(Store::open(&config, &metrics, true));
+            let indexer = Indexer::open(store, FetchFrom::Bitcoind, &config, &metrics);
+            (indexer, tmp)
+        }
+
+        fn dump_history(indexer: &Indexer) -> Vec<(Vec<u8>, Vec<u8>)> {
+            let mut rows = vec![];
+            for prefix in [b"H", b"S", b"C", b"D"] {
+                rows.extend(
+                    indexer
+                        .store
+                        .history_db
+                        .iter_scan(prefix)
+                        .map(|row| (row.key, row.value)),
+                );
+            }
+            rows.sort();
+            rows
+        }
+
+        #[test]
+        fn test_out_of_order_blocks_are_deferred_and_retried() {
+            let (a, b) = dependent_blocks();
+
+            // Out-of-order arrival: B is added and indexed before A exists.
+            let (ooo, _tmp1) = test_indexer();
+            ooo.add(&[b.clone()]);
+            let deferred = ooo.index(&[b.clone()]);
+            assert_eq!(deferred.len(), 1, "spender block must be deferred");
+            assert_eq!(deferred[0].entry.hash(), b.entry.hash());
+            assert!(
+                !ooo.store
+                    .indexed_blockhashes
+                    .read()
+                    .unwrap()
+                    .contains(b.entry.hash()),
+                "deferred block must not be marked indexed"
+            );
+
+            // Once A is added, the retry resolves.
+            ooo.add(&[a.clone()]);
+            assert!(ooo.index(&[a.clone()]).is_empty());
+            assert!(
+                ooo.index(&deferred).is_empty(),
+                "retry after add must succeed"
+            );
+
+            // The result must be identical to in-order processing.
+            let (ord, _tmp2) = test_indexer();
+            ord.add(&[a.clone(), b.clone()]);
+            assert!(ord.index(&[a, b]).is_empty());
+            assert_eq!(dump_history(&ooo), dump_history(&ord));
+        }
+    }
 }
