@@ -89,8 +89,30 @@ pub enum DBFlush {
     Enable,
 }
 
+/// How a DB behaves while the bulk-load sentinel 'F' is absent (initial sync).
+#[derive(Clone, Copy, PartialEq)]
+pub enum BulkCompaction {
+    /// Keep auto-compactions running with widened L0 triggers. Required for
+    /// DBs that are read during the sync itself (txstore: every input's
+    /// prevout lookup) — uncompacted overlapping L0 files degrade point
+    /// lookups linearly with file count.
+    Compact,
+    /// Disable auto-compactions entirely and let L0 accumulate; the one-time
+    /// full_compaction in start_auto_compactions() pays the whole debt in a
+    /// single pass (~2-3x write amplification instead of ~10x for leveled
+    /// compaction during load). Only valid for DBs that nothing reads until
+    /// after the sync (history, cache).
+    Defer,
+}
+
 impl DB {
-    pub fn open(path: &Path, config: &Config, verify_compat: bool, shared_cache: &rocksdb::Cache) -> DB {
+    pub fn open(
+        path: &Path,
+        config: &Config,
+        verify_compat: bool,
+        shared_cache: &rocksdb::Cache,
+        bulk: BulkCompaction,
+    ) -> DB {
         info!("opening DB at {:?}", path);
         let mut db_opts = rocksdb::Options::default();
         db_opts.create_if_missing(true);
@@ -171,8 +193,16 @@ impl DB {
         };
         let key = b"F".to_vec();
         if db.get(&key).is_none() {
-            info!("sentinel 'F' absent in {:?} — widening L0 triggers for bulk load", path);
-            db.apply_bulk_load_triggers();
+            match bulk {
+                BulkCompaction::Compact => {
+                    info!("sentinel 'F' absent in {:?} — widening L0 triggers for bulk load", path);
+                    db.apply_bulk_load_triggers();
+                }
+                BulkCompaction::Defer => {
+                    info!("sentinel 'F' absent in {:?} — deferring all compactions to end of sync", path);
+                    db.defer_bulk_compactions();
+                }
+            }
         } else {
             info!("sentinel 'F' present in {:?} — using steady-state L0 triggers", path);
         }
@@ -202,6 +232,24 @@ impl DB {
             ("level0_file_num_compaction_trigger", trigger.as_str()),
             ("level0_slowdown_writes_trigger", slowdown.as_str()),
             ("level0_stop_writes_trigger", stop.as_str()),
+            ("soft_pending_compaction_bytes_limit", "0"),
+            ("hard_pending_compaction_bytes_limit", "0"),
+        ];
+        self.db.set_options(&opts).unwrap();
+    }
+
+    // BulkCompaction::Defer: no auto-compactions at all during bulk load, and
+    // L0-based stall triggers raised out of reach — with nothing draining L0,
+    // the default stop trigger would park writes forever. Mirrors RocksDB's
+    // PrepareForBulkLoad(). Stalls come back with apply_steady_state_triggers()
+    // after the one-time full compaction.
+    fn defer_bulk_compactions(&self) {
+        let huge = (1u32 << 30).to_string();
+        let opts = [
+            ("disable_auto_compactions", "true"),
+            ("level0_file_num_compaction_trigger", huge.as_str()),
+            ("level0_slowdown_writes_trigger", huge.as_str()),
+            ("level0_stop_writes_trigger", huge.as_str()),
             ("soft_pending_compaction_bytes_limit", "0"),
             ("hard_pending_compaction_bytes_limit", "0"),
         ];

@@ -31,7 +31,7 @@ use crate::util::{
     BlockStatus, Bytes, HeaderEntry, HeaderList, ScriptToAddr,
 };
 
-use crate::new_index::db::{DBFlush, DBRow, ReverseScanIterator, ScanIterator, DB};
+use crate::new_index::db::{BulkCompaction, DBFlush, DBRow, ReverseScanIterator, ScanIterator, DB};
 use crate::new_index::fetch::{start_fetcher, BlockEntry, FetchFrom};
 
 #[cfg(feature = "liquid")]
@@ -68,15 +68,36 @@ impl Store {
         let shared_cache = rocksdb::Cache::new_lru_cache(cache_size_bytes);
         debug!("shared LRU block cache: db_block_cache_mb='{}'", config.db_block_cache_mb);
 
-        let txstore_db = DB::open(&path.join("txstore"), config, verify_compat, &shared_cache);
+        // txstore is read throughout the sync (prevout lookups) so it must keep
+        // compacting; history and cache are write-only until the sync finishes,
+        // so their compaction debt is deferred to the one-time full compaction.
+        let txstore_db = DB::open(
+            &path.join("txstore"),
+            config,
+            verify_compat,
+            &shared_cache,
+            BulkCompaction::Compact,
+        );
         let added_blockhashes = load_blockhashes(&txstore_db, &BlockRow::done_filter());
         info!("{} blocks were added", added_blockhashes.len());
 
-        let history_db = DB::open(&path.join("history"), config, verify_compat, &shared_cache);
+        let history_db = DB::open(
+            &path.join("history"),
+            config,
+            verify_compat,
+            &shared_cache,
+            BulkCompaction::Defer,
+        );
         let indexed_blockhashes = load_blockhashes(&history_db, &BlockRow::done_filter());
         info!("{} blocks were indexed", indexed_blockhashes.len());
 
-        let cache_db = DB::open(&path.join("cache"), config, verify_compat, &shared_cache);
+        let cache_db = DB::open(
+            &path.join("cache"),
+            config,
+            verify_compat,
+            &shared_cache,
+            BulkCompaction::Defer,
+        );
 
         let db_metrics = Arc::new(RocksDbMetrics::new(&metrics));
         txstore_db.start_stats_exporter(Arc::clone(&db_metrics), "txstore_db");
