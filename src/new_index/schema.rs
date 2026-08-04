@@ -1325,6 +1325,36 @@ fn lookup_txos(txstore_db: &DB, outpoints: BTreeSet<OutPoint>) -> Result<HashMap
         .collect()
 }
 
+// Result of a tolerant prevout lookup: the outpoints that resolved, and the
+// ones with no `O` row in the txstore.
+struct PartialTxos {
+    found: HashMap<OutPoint, TxOut>,
+    missing: BTreeSet<OutPoint>,
+}
+
+// Like lookup_txos, but reports absent outpoints instead of erroring on them.
+// During initial sync an absent `O` row normally means the funding block was
+// simply not added yet (blk*.dat files deliver blocks in arrival order, not
+// height order). It can also be an unspendable output — those are never
+// written (see TxOutRow) but also never spent in a valid chain. Database
+// errors still panic, exactly like lookup_txos.
+fn lookup_txos_partial(txstore_db: &DB, outpoints: BTreeSet<OutPoint>) -> PartialTxos {
+    let keys = outpoints.iter().map(TxOutRow::key).collect::<Vec<_>>();
+    let mut found = HashMap::new();
+    let mut missing = BTreeSet::new();
+    for (res, outpoint) in txstore_db.multi_get(keys).into_iter().zip(outpoints) {
+        match res.unwrap() {
+            Some(val) => {
+                found.insert(outpoint, deserialize(&val).expect("failed to parse TxOut"));
+            }
+            None => {
+                missing.insert(outpoint);
+            }
+        }
+    }
+    PartialTxos { found, missing }
+}
+
 fn lookup_txo(txstore_db: &DB, outpoint: &OutPoint) -> Option<TxOut> {
     txstore_db
         .get(&TxOutRow::key(&outpoint))
