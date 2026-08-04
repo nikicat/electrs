@@ -25,7 +25,7 @@ use crate::{chain::{
 use crate::config::Config;
 use crate::daemon::Daemon;
 use crate::errors::*;
-use crate::metrics::{Gauge, HistogramOpts, HistogramTimer, HistogramVec, MetricOpts, Metrics};
+use crate::metrics::{Counter, Gauge, HistogramOpts, HistogramTimer, HistogramVec, MetricOpts, Metrics};
 use crate::util::{
     bincode, full_hash, has_prevout, is_spendable, BlockHeaderMeta, BlockId, BlockMeta,
     BlockStatus, Bytes, HeaderEntry, HeaderList, ScriptToAddr,
@@ -312,6 +312,11 @@ pub struct Indexer {
     prevout_cache: Mutex<PrevoutCache>,
     duration: HistogramVec,
     tip_metric: Gauge,
+    // Monotonic count of blocks indexed into the history db. Unlike the
+    // initial_sync_height gauge (batch-quantized chain position, resets on
+    // restart, sweeps sparse ranges during recovery), rate() over this
+    // counter is a clean throughput signal.
+    blocks_indexed: Counter,
     sync_height: Gauge,
     sync_progress: prometheus::Gauge,
 }
@@ -362,6 +367,10 @@ impl Indexer {
                 &["step"],
             ),
             tip_metric: metrics.gauge(MetricOpts::new("tip_height", "Current chain tip height")),
+            blocks_indexed: metrics.counter(MetricOpts::new(
+                "blocks_indexed_total",
+                "Total number of blocks indexed into the history db",
+            )),
             sync_height: metrics.gauge(MetricOpts::new(
                 "initial_sync_height",
                 "Height of the last block batch completed during initial sync",
@@ -790,6 +799,9 @@ impl Indexer {
 
         let mut indexed_blockhashes = self.store.indexed_blockhashes.write().unwrap();
         indexed_blockhashes.extend(blocks.iter().map(|b| b.entry.hash()));
+        // each block passes write_history exactly once (deferred blocks are
+        // only counted when they finally index), so this never double-counts
+        self.blocks_indexed.inc_by(blocks.len() as u64);
     }
 
     // Undo the history db entries previously written for the given blocks (that were reorged).
