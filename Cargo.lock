@@ -60,7 +60,7 @@ checksum = "d965446196e3b7decd44aa7ee49e31d630118f90ef12f97900f262eb915c951d"
 [[package]]
 name = "bindex"
 version = "0.1.2"
-source = "git+https://github.com/nikicat/bindex-rs?rev=857ab2cd2e90b6d056f846ec127ea258529c2721#857ab2cd2e90b6d056f846ec127ea258529c2721"
+source = "git+https://github.com/nikicat/bindex-rs?rev=2bf5af545f9618e6ab9ecaa9b78e1c6faad1b7be#2bf5af545f9618e6ab9ecaa9b78e1c6faad1b7be"
 dependencies = [
  "bitcoin",
  "bitcoin_slices",
@@ -1070,6 +1070,16 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest",
+ "sha2-asm",
+]
+
+[[package]]
+name = "sha2-asm"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b845214d6175804686b2bd482bcffe96651bb2d1200742b712003504a2dac1ab"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
