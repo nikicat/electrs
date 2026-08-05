@@ -304,6 +304,39 @@ impl PrevoutCache {
     }
 }
 
+// A block awaiting retry because some prevouts were not in the txstore yet
+// (out-of-order blk*.dat delivery), together with the prevouts that DID
+// resolve on the first attempt. Carrying them means a retry only looks up
+// the previously-missing outpoints — without this, retries re-request every
+// prevout, and worse: the first attempt already consumed the resolved ones
+// from the prevout cache (take-on-hit), so re-requesting them degrades to
+// txstore reads.
+struct DeferredBlock {
+    block: BlockEntry,
+    resolved: HashMap<OutPoint, TxOut>,
+}
+
+impl DeferredBlock {
+    fn prevouts(&self) -> BTreeSet<OutPoint> {
+        get_previous_txos(std::slice::from_ref(&self.block))
+    }
+
+    // Move this block's outpoints from the shared resolution map into its own.
+    // Each resolved entry has exactly one spender (no double spends in a valid
+    // chain), so moving is safe.
+    fn absorb(&mut self, found: &mut HashMap<OutPoint, TxOut>) {
+        for op in self.prevouts() {
+            if let Some(txo) = found.remove(&op) {
+                self.resolved.insert(op, txo);
+            }
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.prevouts().iter().all(|op| self.resolved.contains_key(op))
+    }
+}
+
 pub struct Indexer {
     store: Arc<Store>,
     flush: DBFlush,
@@ -321,6 +354,11 @@ pub struct Indexer {
     // rate(hits) / rate(lookups)
     cache_hits: Counter,
     cache_lookups: Counter,
+    // out-of-order deferral machinery: current backlog and cumulative count
+    // of blocks that entered the deferred state (each block at most once —
+    // staying deferred across retries doesn't re-count)
+    deferred_blocks: Gauge,
+    blocks_deferred_total: Counter,
     sync_height: Gauge,
     sync_progress: prometheus::Gauge,
 }
@@ -382,6 +420,14 @@ impl Indexer {
             cache_lookups: metrics.counter(MetricOpts::new(
                 "prevout_cache_lookups_total",
                 "Total prevout lookups (cache hits + txstore lookups)",
+            )),
+            deferred_blocks: metrics.gauge(MetricOpts::new(
+                "deferred_blocks",
+                "Blocks currently deferred awaiting out-of-order prevouts",
+            )),
+            blocks_deferred_total: metrics.counter(MetricOpts::new(
+                "blocks_deferred_total",
+                "Total number of blocks that were deferred at least once",
             )),
             sync_height: metrics.gauge(MetricOpts::new(
                 "initial_sync_height",
@@ -537,7 +583,7 @@ impl Indexer {
         daemon: &Daemon,
         new_headers: &[HeaderEntry],
         chain_tip_height: usize,
-    ) -> Result<Vec<BlockEntry>> {
+    ) -> Result<Vec<DeferredBlock>> {
         let to_process = self.headers_to_process(new_headers);
         debug!(
             "processing {} blocks (add + index) using {:?}",
@@ -550,7 +596,7 @@ impl Indexer {
         // Blocks deferred by index() because a prevout's funding block was not
         // added yet (out-of-order blk*.dat delivery). Bounded in practice by
         // bitcoind's ~1024-block download window; retried on every batch.
-        let mut deferred: Vec<BlockEntry> = Vec::new();
+        let mut deferred: Vec<DeferredBlock> = Vec::new();
 
         start_fetcher(
             self.from,
@@ -587,7 +633,7 @@ impl Indexer {
     }
 
     // Add and index one fetched batch, retrying previously deferred blocks.
-    fn process_batch(&self, blocks: &[BlockEntry], deferred: &mut Vec<BlockEntry>) {
+    fn process_batch(&self, blocks: &[BlockEntry], deferred: &mut Vec<DeferredBlock>) {
         // Add blocks not yet in txstore (idempotent: crash recovery skips already-added blocks)
         let to_add: Vec<_> = {
             let added = self.store.added_blockhashes.read().unwrap();
@@ -618,12 +664,12 @@ impl Indexer {
         // Retry deferred blocks first — their funding blocks may have
         // just been added — then index the current batch.
         if !deferred.is_empty() {
-            let retry = std::mem::take(deferred);
-            *deferred = self.index(&retry);
+            *deferred = self.index_deferred(std::mem::take(deferred));
         }
         if !to_index.is_empty() {
             deferred.extend(self.index(&to_index));
         }
+        self.deferred_blocks.set(deferred.len() as i64);
     }
 
     // Drain any still-deferred blocks. Every funding block has been added by
@@ -631,16 +677,17 @@ impl Indexer {
     // is genuinely missing transactions. This must complete before the synced
     // tip is written (in finish_sync): neither Store::open's tip-walk nor
     // get_new_headers can rediscover an unindexed gap beneath a written tip.
-    fn drain_deferred(&self, mut deferred: Vec<BlockEntry>) {
+    fn drain_deferred(&self, mut deferred: Vec<DeferredBlock>) {
         while !deferred.is_empty() {
             let retry_len = deferred.len();
             info!("retrying {} deferred out-of-order blocks", retry_len);
-            deferred = self.index(&deferred);
+            deferred = self.index_deferred(deferred);
+            self.deferred_blocks.set(deferred.len() as i64);
             if deferred.len() == retry_len {
                 panic!(
                     "datadir corrupt — missing prevouts for {} blocks (first: {})",
                     deferred.len(),
-                    deferred[0].entry.hash()
+                    deferred[0].block.entry.hash()
                 );
             }
         }
@@ -744,30 +791,34 @@ impl Indexer {
     // spends an output whose funding transaction is not in the txstore yet —
     // possible during initial sync because blk*.dat files hold blocks in
     // arrival order, not height order (see issue #214). Returns the deferred
-    // blocks; the caller must retry them (after more blocks were added) and
-    // ensure none remain before the synced tip is committed.
-    fn index(&self, blocks: &[BlockEntry]) -> Vec<BlockEntry> {
-        let txos = {
-            let _timer = self.start_timer("index_lookup");
-            let mut outpoints = get_previous_txos(blocks);
-            let mut cached = HashMap::new();
-            {
-                let mut cache = self.prevout_cache.lock().unwrap();
-                outpoints.retain(|outpoint| match cache.take(outpoint) {
-                    Some(txo) => {
-                        cached.insert(*outpoint, txo);
-                        false
-                    }
-                    None => true,
-                });
-                cache.log_stats(cached.len(), outpoints.len());
-            }
-            self.cache_hits.inc_by(cached.len() as u64);
-            self.cache_lookups.inc_by((cached.len() + outpoints.len()) as u64);
-            let mut txos = lookup_txos_partial(&self.store.txstore_db, outpoints);
-            txos.found.extend(cached);
-            txos
-        };
+    // blocks (with their already-resolved prevouts); the caller must retry
+    // them via index_deferred (after more blocks were added) and ensure none
+    // remain before the synced tip is committed.
+    // Resolve outpoints against the prevout cache first (take-on-hit), then
+    // the txstore for the rest. Shared by index() and index_deferred().
+    fn resolve_txos(&self, mut outpoints: BTreeSet<OutPoint>) -> PartialTxos {
+        let _timer = self.start_timer("index_lookup");
+        let mut cached = HashMap::new();
+        {
+            let mut cache = self.prevout_cache.lock().unwrap();
+            outpoints.retain(|outpoint| match cache.take(outpoint) {
+                Some(txo) => {
+                    cached.insert(*outpoint, txo);
+                    false
+                }
+                None => true,
+            });
+            cache.log_stats(cached.len(), outpoints.len());
+        }
+        self.cache_hits.inc_by(cached.len() as u64);
+        self.cache_lookups.inc_by((cached.len() + outpoints.len()) as u64);
+        let mut txos = lookup_txos_partial(&self.store.txstore_db, outpoints);
+        txos.found.extend(cached);
+        txos
+    }
+
+    fn index(&self, blocks: &[BlockEntry]) -> Vec<DeferredBlock> {
+        let txos = self.resolve_txos(get_previous_txos(blocks));
 
         if txos.missing.is_empty() {
             self.write_history(blocks, &txos.found);
@@ -790,10 +841,69 @@ impl Indexer {
             deferred.len(),
             txos.missing.len()
         );
+        self.blocks_deferred_total.inc_by(deferred.len() as u64);
         if !ready.is_empty() {
             self.write_history(&ready, &txos.found);
         }
+        let mut found = txos.found;
         deferred
+            .into_iter()
+            .map(|block| {
+                let mut d = DeferredBlock {
+                    block,
+                    resolved: HashMap::new(),
+                };
+                d.absorb(&mut found);
+                d
+            })
+            .collect()
+    }
+
+    // Retry deferred blocks, looking up only the outpoints still unresolved
+    // on the previous attempt.
+    fn index_deferred(&self, deferred: Vec<DeferredBlock>) -> Vec<DeferredBlock> {
+        if deferred.is_empty() {
+            return deferred;
+        }
+        let missing = deferred
+            .iter()
+            .flat_map(|d| {
+                let resolved = &d.resolved;
+                d.prevouts()
+                    .into_iter()
+                    .filter(move |op| !resolved.contains_key(op))
+            })
+            .collect();
+        let mut txos = self.resolve_txos(missing);
+
+        // move each newly resolved prevout into its spender block, then split
+        // on completeness
+        let (ready, still): (Vec<DeferredBlock>, Vec<DeferredBlock>) = deferred
+            .into_iter()
+            .map(|mut d| {
+                d.absorb(&mut txos.found);
+                d
+            })
+            .partition(DeferredBlock::is_complete);
+        if !still.is_empty() {
+            info!(
+                "still deferred {} out-of-order blocks ({} unresolved prevouts)",
+                still.len(),
+                txos.missing.len()
+            );
+        }
+        if !ready.is_empty() {
+            let mut merged: HashMap<OutPoint, TxOut> = HashMap::new();
+            let blocks: Vec<BlockEntry> = ready
+                .into_iter()
+                .map(|d| {
+                    merged.extend(d.resolved);
+                    d.block
+                })
+                .collect();
+            self.write_history(&blocks, &merged);
+        }
+        still
     }
 
     fn write_history(&self, blocks: &[BlockEntry], previous_txos_map: &HashMap<OutPoint, TxOut>) {
@@ -2531,7 +2641,7 @@ mod tests {
             ooo.add(&[b.clone()]);
             let deferred = ooo.index(&[b.clone()]);
             assert_eq!(deferred.len(), 1, "spender block must be deferred");
-            assert_eq!(deferred[0].entry.hash(), b.entry.hash());
+            assert_eq!(deferred[0].block.entry.hash(), b.entry.hash());
             assert!(
                 !ooo.store
                     .indexed_blockhashes
@@ -2545,7 +2655,7 @@ mod tests {
             ooo.add(&[a.clone()]);
             assert!(ooo.index(&[a.clone()]).is_empty());
             assert!(
-                ooo.index(&deferred).is_empty(),
+                ooo.index_deferred(deferred).is_empty(),
                 "retry after add must succeed"
             );
 
@@ -2554,6 +2664,71 @@ mod tests {
             ord.add(&[a.clone(), b.clone()]);
             assert!(ord.index(&[a, b]).is_empty());
             assert_eq!(dump_history(&ooo), dump_history(&ord));
+        }
+
+        #[test]
+        fn test_deferred_block_carries_resolved_prevouts() {
+            // c spends outputs of both a (added) and b (not yet added):
+            // it defers with o1 resolved and o2 missing. The carried o1 must
+            // be the only source on retry — its txstore row is deleted and
+            // the cache entry was consumed by the first attempt (take-on-hit).
+            let cb_a = coinbase(1);
+            let cb_b = coinbase(2);
+            let o1 = OutPoint::new(cb_a.compute_txid(), 0);
+            let o2 = OutPoint::new(cb_b.compute_txid(), 0);
+            let spend = Transaction {
+                version: bitcoin::transaction::Version::ONE,
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: [o1, o2]
+                    .iter()
+                    .map(|op| TxIn {
+                        previous_output: *op,
+                        script_sig: Script::new(),
+                        sequence: Sequence::MAX,
+                        witness: Default::default(),
+                    })
+                    .collect(),
+                output: vec![TxOut {
+                    value: bitcoin::Amount::from_sat(98_0000_0000),
+                    script_pubkey: p2pkh(4),
+                }],
+            };
+            let a = block_entry(1, BlockHash::all_zeros(), vec![cb_a]);
+            let b = block_entry(2, a.entry.hash().clone(), vec![cb_b]);
+            let c = block_entry(3, b.entry.hash().clone(), vec![coinbase(3), spend]);
+
+            let (ooo, _tmp1) = test_indexer();
+            ooo.add(&[a.clone(), c.clone()]);
+            let deferred = ooo.index(&[c.clone()]);
+            assert_eq!(deferred.len(), 1);
+            assert_eq!(deferred[0].resolved.len(), 1, "o1 must be carried");
+            assert!(deferred[0].resolved.contains_key(&o1));
+
+            // remove o1 from the txstore: a re-request would now come up
+            // missing and keep c deferred
+            ooo.store.txstore_db.delete_rows(
+                vec![DBRow {
+                    key: TxOutRow::key(&o1),
+                    value: vec![],
+                }],
+                DBFlush::Enable,
+            );
+
+            ooo.add(&[b.clone()]);
+            assert!(ooo.index(&[a.clone(), b.clone()]).is_empty());
+            assert!(
+                ooo.index_deferred(deferred).is_empty(),
+                "retry must complete from the carried prevout + newly added o2"
+            );
+
+            let (ord, _tmp2) = test_indexer();
+            ord.add(&[a.clone(), b.clone(), c.clone()]);
+            assert!(ord.index(&[a, b, c]).is_empty());
+            assert_eq!(
+                dump_history(&ooo),
+                dump_history(&ord),
+                "history must be byte-identical to in-order indexing"
+            );
         }
     }
 }
