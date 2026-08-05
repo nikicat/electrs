@@ -356,6 +356,9 @@ struct IndexerMetrics {
     // staying deferred across retries doesn't re-count)
     deferred_blocks: Gauge,
     blocks_deferred: Counter,
+    // header-download phase of every (re)start: ~961k headers take minutes,
+    // and the height gauges sit at 0 the whole time without this
+    headers_progress: prometheus::Gauge,
     sync_height: Gauge,
     sync_progress: prometheus::Gauge,
 }
@@ -430,6 +433,10 @@ impl IndexerMetrics {
                 "blocks_deferred_total",
                 "Total number of blocks that were deferred at least once",
             )),
+            headers_progress: metrics.float_gauge(MetricOpts::new(
+                "initial_headers_progress_pct",
+                "Header download progress as a percentage of the chain tip height",
+            )),
             sync_height: metrics.gauge(MetricOpts::new(
                 "initial_sync_height",
                 "Height of the last block batch completed during initial sync",
@@ -500,7 +507,12 @@ impl Indexer {
         tip: &BlockHash,
     ) -> Result<(Vec<HeaderEntry>, Option<usize>)> {
         let indexed_headers = self.store.indexed_headers.read().unwrap();
-        let raw_new_headers = daemon.get_new_headers(&indexed_headers, tip)?;
+        let raw_new_headers = daemon.get_new_headers(&indexed_headers, tip, |done, total| {
+            self.metrics
+                .headers_progress
+                .set(done as f64 / total.max(1) as f64 * 100.0);
+        })?;
+        self.metrics.headers_progress.set(100.0);
         let (new_headers, reorged_since) = indexed_headers.preprocess(raw_new_headers, tip);
 
         if let Some(tip) = new_headers.last() {

@@ -1015,7 +1015,11 @@ impl Daemon {
     }
 
     #[trace]
-    fn get_all_headers(&self, tip: &BlockHash) -> Result<Vec<BlockHeader>> {
+    fn get_all_headers(
+        &self,
+        tip: &BlockHash,
+        on_progress: impl Fn(usize, usize),
+    ) -> Result<Vec<BlockHeader>> {
         let info: Value = self.request("getblockheader", json!([tip]))?;
         let tip_height = info
             .get("height")
@@ -1030,6 +1034,7 @@ impl Daemon {
             assert!(headers.len() == heights.len());
 
             result.append(&mut headers);
+            on_progress(result.len(), tip_height + 1);
 
             debug!(
                 "downloaded {}/{} block headers ({:.0}%)",
@@ -1054,11 +1059,12 @@ impl Daemon {
         &self,
         indexed_headers: &HeaderList,
         bestblockhash: &BlockHash,
+        on_progress: impl Fn(usize, usize),
     ) -> Result<Vec<BlockHeader>> {
         // Iterate back over headers until known blockash is found:
         if indexed_headers.is_empty() {
             info!("downloading all block headers up to {}", bestblockhash);
-            return self.get_all_headers(bestblockhash);
+            return self.get_all_headers(bestblockhash, on_progress);
         }
         debug!(
             "downloading new block headers ({} already indexed) from {}",
