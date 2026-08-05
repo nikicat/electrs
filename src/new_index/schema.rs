@@ -337,14 +337,11 @@ impl DeferredBlock {
     }
 }
 
-pub struct Indexer {
-    store: Arc<Store>,
-    flush: DBFlush,
-    from: FetchFrom,
-    iconfig: IndexerConfig,
-    prevout_cache: Mutex<PrevoutCache>,
+// Every prometheus instrument the Indexer publishes, grouped so the
+// Indexer's own fields are all actual state.
+struct IndexerMetrics {
     duration: HistogramVec,
-    tip_metric: Gauge,
+    tip_height: Gauge,
     // Monotonic count of blocks indexed into the history db. Unlike the
     // initial_sync_height gauge (batch-quantized chain position, resets on
     // restart, sweeps sparse ranges during recovery), rate() over this
@@ -358,9 +355,18 @@ pub struct Indexer {
     // of blocks that entered the deferred state (each block at most once —
     // staying deferred across retries doesn't re-count)
     deferred_blocks: Gauge,
-    blocks_deferred_total: Counter,
+    blocks_deferred: Counter,
     sync_height: Gauge,
     sync_progress: prometheus::Gauge,
+}
+
+pub struct Indexer {
+    store: Arc<Store>,
+    flush: DBFlush,
+    from: FetchFrom,
+    iconfig: IndexerConfig,
+    prevout_cache: Mutex<PrevoutCache>,
+    metrics: IndexerMetrics,
 }
 
 struct IndexerConfig {
@@ -396,19 +402,14 @@ pub struct ChainQuery {
 }
 
 // TODO: &[Block] should be an iterator / a queue.
-impl Indexer {
-    pub fn open(store: Arc<Store>, from: FetchFrom, config: &Config, metrics: &Metrics) -> Self {
-        Indexer {
-            store,
-            flush: DBFlush::Disable,
-            from,
-            iconfig: IndexerConfig::from(config),
-            prevout_cache: Mutex::new(PrevoutCache::new(config.prevout_cache_mb)),
+impl IndexerMetrics {
+    fn new(metrics: &Metrics) -> Self {
+        IndexerMetrics {
             duration: metrics.histogram_vec(
                 HistogramOpts::new("index_duration", "Index update duration (in seconds)"),
                 &["step"],
             ),
-            tip_metric: metrics.gauge(MetricOpts::new("tip_height", "Current chain tip height")),
+            tip_height: metrics.gauge(MetricOpts::new("tip_height", "Current chain tip height")),
             blocks_indexed: metrics.counter(MetricOpts::new(
                 "blocks_indexed_total",
                 "Total number of blocks indexed into the history db",
@@ -425,7 +426,7 @@ impl Indexer {
                 "deferred_blocks",
                 "Blocks currently deferred awaiting out-of-order prevouts",
             )),
-            blocks_deferred_total: metrics.counter(MetricOpts::new(
+            blocks_deferred: metrics.counter(MetricOpts::new(
                 "blocks_deferred_total",
                 "Total number of blocks that were deferred at least once",
             )),
@@ -439,9 +440,22 @@ impl Indexer {
             )),
         }
     }
+}
+
+impl Indexer {
+    pub fn open(store: Arc<Store>, from: FetchFrom, config: &Config, metrics: &Metrics) -> Self {
+        Indexer {
+            store,
+            flush: DBFlush::Disable,
+            from,
+            iconfig: IndexerConfig::from(config),
+            prevout_cache: Mutex::new(PrevoutCache::new(config.prevout_cache_mb)),
+            metrics: IndexerMetrics::new(metrics),
+        }
+    }
 
     fn start_timer(&self, name: &str) -> HistogramTimer {
-        self.duration.with_label_values(&[name]).start_timer()
+        self.metrics.duration.with_label_values(&[name]).start_timer()
     }
 
     // Headers that need any work: either not yet added to txstore or not yet indexed to history.
@@ -621,9 +635,9 @@ impl Indexer {
 
             if let Some(last) = blocks.last() {
                 let h = last.entry.height();
-                self.sync_height.set(h as i64);
+                self.metrics.sync_height.set(h as i64);
                 if chain_tip_height > 0 {
-                    self.sync_progress
+                    self.metrics.sync_progress
                         .set(h as f64 / chain_tip_height as f64 * 100.0);
                 }
             }
@@ -669,7 +683,7 @@ impl Indexer {
         if !to_index.is_empty() {
             deferred.extend(self.index(&to_index));
         }
-        self.deferred_blocks.set(deferred.len() as i64);
+        self.metrics.deferred_blocks.set(deferred.len() as i64);
     }
 
     // Drain any still-deferred blocks. Every funding block has been added by
@@ -682,7 +696,7 @@ impl Indexer {
             let retry_len = deferred.len();
             info!("retrying {} deferred out-of-order blocks", retry_len);
             deferred = self.index_deferred(deferred);
-            self.deferred_blocks.set(deferred.len() as i64);
+            self.metrics.deferred_blocks.set(deferred.len() as i64);
             if deferred.len() == retry_len {
                 panic!(
                     "datadir corrupt — missing prevouts for {} blocks (first: {})",
@@ -744,7 +758,7 @@ impl Indexer {
             self.from = FetchFrom::Bitcoind;
         }
 
-        self.tip_metric.set(headers.best_height() as i64);
+        self.metrics.tip_height.set(headers.best_height() as i64);
     }
 
     fn add(&self, blocks: &[BlockEntry]) {
@@ -810,8 +824,8 @@ impl Indexer {
             });
             cache.log_stats(cached.len(), outpoints.len());
         }
-        self.cache_hits.inc_by(cached.len() as u64);
-        self.cache_lookups.inc_by((cached.len() + outpoints.len()) as u64);
+        self.metrics.cache_hits.inc_by(cached.len() as u64);
+        self.metrics.cache_lookups.inc_by((cached.len() + outpoints.len()) as u64);
         let mut txos = lookup_txos_partial(&self.store.txstore_db, outpoints);
         txos.found.extend(cached);
         txos
@@ -841,7 +855,7 @@ impl Indexer {
             deferred.len(),
             txos.missing.len()
         );
-        self.blocks_deferred_total.inc_by(deferred.len() as u64);
+        self.metrics.blocks_deferred.inc_by(deferred.len() as u64);
         if !ready.is_empty() {
             self.write_history(&ready, &txos.found);
         }
@@ -925,7 +939,7 @@ impl Indexer {
         indexed_blockhashes.extend(blocks.iter().map(|b| b.entry.hash()));
         // each block passes write_history exactly once (deferred blocks are
         // only counted when they finally index), so this never double-counts
-        self.blocks_indexed.inc_by(blocks.len() as u64);
+        self.metrics.blocks_indexed.inc_by(blocks.len() as u64);
     }
 
     // Undo the history db entries previously written for the given blocks (that were reorged).
