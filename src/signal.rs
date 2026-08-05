@@ -1,11 +1,24 @@
 use bitcoin::BlockHash;
 use crossbeam_channel::{self as channel, after, select};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use signal_hook::consts::{SIGINT, SIGTERM, SIGUSR1};
 
 use crate::errors::*;
+
+// Process-wide shutdown level, stamped by the signal thread (which also logs
+// the signal number). A terminating signal is process-scoped state, so it
+// lives here as a static observed by long-running producers (the block
+// fetchers) instead of being threaded through every signature on that path.
+// Sticky and read-only for observers, unlike the bounded(1) channel below
+// whose single buffered message wait() consumes.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+pub fn shutdown_requested() -> bool {
+    SHUTDOWN.load(Ordering::Relaxed)
+}
 
 #[derive(Clone)] // so multiple threads could wait on signals
 pub struct Waiter {
@@ -19,6 +32,10 @@ fn notify(signals: &[i32]) -> channel::Receiver<i32> {
         signal_hook::iterator::Signals::new(signals).expect("failed to register signal hook");
     thread::spawn(move || {
         for signal in signals.forever() {
+            if signal != SIGUSR1 {
+                info!("received signal {} — shutdown requested", signal);
+                SHUTDOWN.store(true, Ordering::Relaxed);
+            }
             s.send(signal)
                 .unwrap_or_else(|_| panic!("failed to send signal {}", signal));
         }

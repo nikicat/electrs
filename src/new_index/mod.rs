@@ -13,5 +13,6 @@ pub use self::mempool::Mempool;
 pub use self::query::{Query, GETBLOCKTEMPLATE_TTL};
 pub use self::schema::{
     compute_script_hash, parse_hash, ChainQuery, FundingInfo, GetAmountVal, Indexer, ScriptStats,
-    SpendingInfo, SpendingInput, Store, TxHistoryInfo, TxHistoryKey, TxHistoryRow, Utxo,
+    SpendingInfo, SpendingInput, Store, TxHistoryInfo, TxHistoryKey, TxHistoryRow, UpdateResult,
+    Utxo,
 };

@@ -20,7 +20,7 @@ use electrs::{
     electrum::RPC as ElectrumRPC,
     errors::*,
     metrics::Metrics,
-    new_index::{precache, zmq, ChainQuery, FetchFrom, Indexer, Mempool, Query, Store},
+    new_index::{precache, zmq, ChainQuery, FetchFrom, Indexer, Mempool, Query, Store, UpdateResult},
     rest,
     signal::Waiter,
 };
@@ -85,7 +85,10 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
         &metrics,
     );
     info!("starting initial sync");
-    let mut tip = indexer.update(&daemon)?;
+    let mut tip = match indexer.update(&daemon)? {
+        UpdateResult::Tip(tip) => tip,
+        UpdateResult::ShuttingDown => return Ok(()),
+    };
     info!("initial sync complete, tip at {}", tip);
 
     let chain = Arc::new(ChainQuery::new(
@@ -111,7 +114,10 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
     while !Mempool::update(&mempool, &daemon, &tip)? {
         // Mempool syncing was aborted because the chain tip moved;
         // Index the new block(s) and try again.
-        tip = indexer.update(&daemon)?;
+        tip = match indexer.update(&daemon)? {
+            UpdateResult::Tip(tip) => tip,
+            UpdateResult::ShuttingDown => return Ok(()),
+        };
     }
 
     #[cfg(feature = "liquid")]
@@ -149,17 +155,19 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
     loop {
         main_loop_count.inc();
 
-        if let Err(err) = signal.wait(Duration::from_secs(5), true) {
-            info!("stopping server: {}", err);
-            rest_server.stop();
-            // the electrum server is stopped when dropped
+        // Err means shutdown: a terminating signal (already logged by the
+        // signal thread) or, pathologically, a broken signal channel.
+        if signal.wait(Duration::from_secs(5), true).is_err() {
             break;
         }
 
         // Index new blocks
         let current_tip = daemon.getbestblockhash()?;
         if current_tip != tip {
-            tip = indexer.update(&daemon)?;
+            match indexer.update(&daemon)? {
+                UpdateResult::Tip(new_tip) => tip = new_tip,
+                UpdateResult::ShuttingDown => break,
+            }
         };
 
         // Update mempool
@@ -170,6 +178,8 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
         // Update subscribed clients
         electrum_server.notify();
     }
+    rest_server.stop();
+    // the electrum server is stopped when dropped
     info!("server stopped");
     Ok(())
 }

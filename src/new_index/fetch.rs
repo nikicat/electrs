@@ -19,6 +19,7 @@ use electrs_macros::trace;
 use crate::chain::{Block, BlockHash, Txid};
 use crate::daemon::Daemon;
 use crate::errors::*;
+use crate::signal;
 use crate::util::{spawn_thread, HeaderEntry, SyncChannel};
 
 #[derive(Clone, Copy, Debug)]
@@ -52,19 +53,33 @@ pub struct BlockEntry {
 
 type SizedBlock = (Block, u32);
 
+// Why a fetcher stream ended — reported by the producer thread itself, so
+// consumers never have to infer it from ambient state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FetchOutcome {
+    // every requested item was delivered
+    Completed,
+    // shutdown was requested; production stopped at a natural boundary
+    // (a blk file / an RPC batch) and the remainder was never fetched
+    Interrupted,
+}
+
 pub struct Fetcher<T> {
     receiver: Receiver<T>,
-    thread: thread::JoinHandle<()>,
+    thread: thread::JoinHandle<FetchOutcome>,
 }
 
 impl<T> Fetcher<T> {
-    fn from(receiver: Receiver<T>, thread: thread::JoinHandle<()>) -> Self {
+    fn from(receiver: Receiver<T>, thread: thread::JoinHandle<FetchOutcome>) -> Self {
         Fetcher { receiver, thread }
     }
 
-    pub fn map<F>(self, mut func: F)
+    // Consume every delivered item, then report why the stream ended.
+    // Chained stages propagate their upstream's outcome by returning it
+    // from their own thread.
+    pub fn for_each<F>(self, mut func: F) -> FetchOutcome
     where
-        F: FnMut(T) -> (),
+        F: FnMut(T),
     {
         for item in self.receiver {
             func(item);
@@ -92,6 +107,9 @@ fn bitcoind_fetcher(
             let mut fetcher_count = 0;
             let total_blocks_fetched = new_headers.len();
             for entries in new_headers.chunks(batch_size) {
+                if signal::shutdown_requested() {
+                    return FetchOutcome::Interrupted;
+                }
                 if fetcher_count % 50 == 0 && total_blocks_fetched >= 50 {
                     let batch_height = entries.last().map(|e| e.height()).unwrap_or(0);
                     info!("fetching blocks {}/{} ({:.1}%)",
@@ -126,6 +144,7 @@ fn bitcoind_fetcher(
                     .expect("failed to send fetched blocks");
                 log::debug!("last fetch {:?}", entries.last());
             }
+            FetchOutcome::Completed
         }),
     ))
 }
@@ -151,7 +170,7 @@ fn blkfiles_fetcher(
     Ok(Fetcher::from(
         chan.into_receiver(),
         spawn_thread("blkfiles_fetcher", move || {
-            parser.map(|sizedblocks| {
+            let outcome = parser.for_each(|sizedblocks| {
                 let block_count = sizedblocks.len();
                 let mut index = 0;
                 let block_entries: Vec<BlockEntry> = sizedblocks
@@ -181,12 +200,15 @@ fn blkfiles_fetcher(
                     .send(block_entries)
                     .expect("failed to send blocks entries from blk*.dat files");
             });
-            if !entry_map.is_empty() {
+            // an interrupted reader legitimately leaves headers unread; a
+            // completed one must have delivered every requested block
+            if outcome == FetchOutcome::Completed && !entry_map.is_empty() {
                 panic!(
                     "failed to index {} blocks from blk*.dat files",
                     entry_map.len()
                 )
             }
+            outcome
         }),
     ))
 }
@@ -203,6 +225,10 @@ fn blkfiles_reader(blk_files: Vec<PathBuf>, xor_key: Option<[u8; 8]>) -> Fetcher
         spawn_thread("blkfiles_reader", move || {
             let blk_files_len = blk_files.len();
             for (count, path) in blk_files.iter().enumerate() {
+                if signal::shutdown_requested() {
+                    info!("block file reader stopping at {}/{}", count, blk_files_len);
+                    return FetchOutcome::Interrupted;
+                }
                 info!("block file reading {:}/{:} {:.2}%",
                     count,
                     blk_files_len,
@@ -219,6 +245,7 @@ fn blkfiles_reader(blk_files: Vec<PathBuf>, xor_key: Option<[u8; 8]>) -> Fetcher
                     .send(blob)
                     .unwrap_or_else(|_| panic!("failed to send {:?} contents", path));
             }
+            FetchOutcome::Completed
         }),
     )
 }
@@ -245,13 +272,13 @@ fn blkfiles_parser(blobs: Fetcher<Vec<u8>>, magic: u32) -> Fetcher<Vec<SizedBloc
                 .thread_name(|i| format!("parse-blocks-{}", i))
                 .build()
                 .unwrap();
-            blobs.map(|blob| {
+            blobs.for_each(|blob| {
                 trace!("parsing {} bytes", blob.len());
                 let blocks = parse_blocks(&pool, blob, magic).expect("failed to parse blk*.dat file");
                 sender
                     .send(blocks)
                     .expect("failed to send blocks from blk*.dat file");
-            });
+            })
         }),
     )
 }
@@ -300,4 +327,28 @@ fn parse_blocks(pool: &rayon::ThreadPool, blob: Vec<u8>, magic: u32) -> Result<V
             .map(|(slice, size)| (deserialize(slice).expect("failed to parse Block"), size))
             .collect()
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The contract everything above relies on: every delivered item is
+    // processed, then the producer's own outcome reaches the consumer.
+    #[test]
+    fn for_each_delivers_all_items_then_reports_producer_outcome() {
+        let chan = SyncChannel::new(2);
+        let sender = chan.sender();
+        let fetcher = Fetcher::from(
+            chan.into_receiver(),
+            spawn_thread("test_producer", move || {
+                sender.send(1).unwrap();
+                sender.send(2).unwrap();
+                FetchOutcome::Interrupted
+            }),
+        );
+        let mut seen = vec![];
+        assert_eq!(fetcher.for_each(|i| seen.push(i)), FetchOutcome::Interrupted);
+        assert_eq!(seen, vec![1, 2]);
+    }
 }

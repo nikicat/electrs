@@ -32,7 +32,7 @@ use crate::util::{
 };
 
 use crate::new_index::db::{BulkCompaction, DBFlush, DBRow, ReverseScanIterator, ScanIterator, DB};
-use crate::new_index::fetch::{start_fetcher, BlockEntry, FetchFrom};
+use crate::new_index::fetch::{start_fetcher, BlockEntry, FetchFrom, FetchOutcome};
 
 #[cfg(feature = "liquid")]
 use crate::elements::{asset, ebcompact::TxidCompat, peg};
@@ -363,6 +363,22 @@ struct IndexerMetrics {
     sync_progress: prometheus::Gauge,
 }
 
+// How a process_new_blocks() run ended.
+enum SyncOutcome {
+    // every fetched block was added+indexed; `deferred` still awaits retry
+    Completed { deferred: Vec<DeferredBlock> },
+    // shutdown was requested: the fetcher stopped early and the deferred
+    // blocks were dropped (their D-rows are absent, so the next start
+    // simply redoes them)
+    Interrupted,
+}
+
+// update()'s two normal endings — a shutdown request is not an error.
+pub enum UpdateResult {
+    Tip(BlockHash),
+    ShuttingDown,
+}
+
 pub struct Indexer {
     store: Arc<Store>,
     flush: DBFlush,
@@ -521,7 +537,7 @@ impl Indexer {
         Ok((new_headers, reorged_since))
     }
 
-    pub fn update(&mut self, daemon: &Daemon) -> Result<BlockHash> {
+    pub fn update(&mut self, daemon: &Daemon) -> Result<UpdateResult> {
         let daemon = daemon.reconnect()?;
         let tip = daemon.getbestblockhash()?;
 
@@ -533,11 +549,25 @@ impl Indexer {
             self.undo_reorged(&daemon, reorged_since, chain_tip_height)?;
         }
 
-        let deferred = self.process_new_blocks(&daemon, &new_headers, chain_tip_height)?;
-        self.drain_deferred(deferred);
-        self.finish_sync(&tip, new_headers);
-
-        Ok(tip)
+        match self.process_new_blocks(&daemon, &new_headers, chain_tip_height)? {
+            SyncOutcome::Interrupted => {
+                // Salvage what the memtables hold (the WAL is off during bulk
+                // load, a kill would lose it) so the next start's D-row scan
+                // resumes from here. The tip is NOT written — only finish_sync
+                // does that, after a full drain — so the partial sync stays
+                // recoverable.
+                info!("sync interrupted: flushing DBs");
+                self.store.txstore_db.flush();
+                self.store.history_db.flush();
+                self.store.cache_db.flush();
+                Ok(UpdateResult::ShuttingDown)
+            }
+            SyncOutcome::Completed { deferred } => {
+                self.drain_deferred(deferred);
+                self.finish_sync(&tip, new_headers);
+                Ok(UpdateResult::Tip(tip))
+            }
+        }
     }
 
     // Undo the history rows of reorged (stale) blocks, so the new best chain
@@ -583,7 +613,10 @@ impl Indexer {
             self.iconfig.block_batch_size,
             chain_tip_height,
         )?
-        .map(|blocks| self.undo_index(&blocks));
+        // outcome deliberately unused: undo chunks are individually atomic,
+        // and if this was interrupted, process_new_blocks' fetcher observes
+        // the same shutdown level and ends the update immediately after
+        .for_each(|blocks| self.undo_index(&blocks));
         Ok(())
     }
 
@@ -609,7 +642,7 @@ impl Indexer {
         daemon: &Daemon,
         new_headers: &[HeaderEntry],
         chain_tip_height: usize,
-    ) -> Result<Vec<DeferredBlock>> {
+    ) -> Result<SyncOutcome> {
         let to_process = self.headers_to_process(new_headers);
         debug!(
             "processing {} blocks (add + index) using {:?}",
@@ -624,14 +657,14 @@ impl Indexer {
         // bitcoind's ~1024-block download window; retried on every batch.
         let mut deferred: Vec<DeferredBlock> = Vec::new();
 
-        start_fetcher(
+        let outcome = start_fetcher(
             self.from,
             daemon,
             to_process,
             self.iconfig.block_batch_size,
             chain_tip_height,
         )?
-        .map(|blocks| {
+        .for_each(|blocks| {
             if fetcher_count % 25 == 0 && to_process_total > 20 {
                 let batch_height = blocks.last().map(|b| b.entry.height()).unwrap_or(0);
                 info!(
@@ -655,7 +688,13 @@ impl Indexer {
             }
         });
 
-        Ok(deferred)
+        Ok(match outcome {
+            FetchOutcome::Completed => SyncOutcome::Completed { deferred },
+            FetchOutcome::Interrupted => {
+                info!("dropping {} deferred blocks (redone next start)", deferred.len());
+                SyncOutcome::Interrupted
+            }
+        })
     }
 
     // Add and index one fetched batch, retrying previously deferred blocks.
