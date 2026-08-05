@@ -20,7 +20,7 @@ use crate::chain::{Block, BlockHash, BlockHeader, Txid};
 use crate::daemon::Daemon;
 use crate::errors::*;
 use crate::signal;
-use crate::util::{spawn_thread, HeaderEntry, SyncChannel};
+use crate::util::{chunked, spawn_thread, HeaderEntry, SyncChannel};
 
 #[derive(Clone, Copy, Debug)]
 pub enum FetchFrom {
@@ -37,7 +37,7 @@ pub fn start_fetcher(
     chain_tip_height: usize,
 ) -> Result<Fetcher<Vec<BlockEntry>>> {
     match from {
-        FetchFrom::Bitcoind => bitcoind_fetcher(daemon, new_headers, batch_size, chain_tip_height),
+        FetchFrom::Bitcoind => bitcoind_fetcher(daemon, new_headers, batch_size),
         FetchFrom::BlkFiles => blkfiles_fetcher(daemon, new_headers),
     }
 }
@@ -62,6 +62,20 @@ pub enum FetchOutcome {
     Interrupted,
 }
 
+// A batch producer driven by Fetcher::produce: one batch per work item,
+// with a completion hook for end-of-stream assertions.
+trait Producer: Send + 'static {
+    type Item: Send + 'static;
+    type Batch: Send + 'static;
+    fn produce(&mut self, item: Self::Item) -> Self::Batch;
+    // runs only after every item was produced
+    fn finish(self)
+    where
+        Self: Sized,
+    {
+    }
+}
+
 pub struct Fetcher<T> {
     receiver: Receiver<T>,
     thread: thread::JoinHandle<FetchOutcome>,
@@ -70,6 +84,41 @@ pub struct Fetcher<T> {
 impl<T> Fetcher<T> {
     fn from(receiver: Receiver<T>, thread: thread::JoinHandle<FetchOutcome>) -> Self {
         Fetcher { receiver, thread }
+    }
+
+    // The production protocol shared by every fetcher: one batch per work
+    // item on a named thread, observing shutdown between items, with the
+    // outcome reported by this producer itself.
+    fn produce<P>(name: &'static str, items: Vec<P::Item>, mut producer: P) -> Fetcher<T>
+    where
+        T: Send + 'static,
+        P: Producer<Batch = T>,
+    {
+        // 2 batches of read-ahead overlap production with consumption
+        let chan = SyncChannel::new(2);
+        let sender = chan.sender();
+        Fetcher::from(
+            chan.into_receiver(),
+            spawn_thread(name, move || {
+                let total = items.len();
+                for (i, item) in items.into_iter().enumerate() {
+                    if signal::shutdown_requested() {
+                        info!("{} stopping early at {}/{}", name, i, total);
+                        return FetchOutcome::Interrupted;
+                    }
+                    // silent when there is no backlog (steady-state tip
+                    // following produces single-item runs)
+                    if total > 1 {
+                        info!("{} {}/{}", name, i, total);
+                    }
+                    sender
+                        .send(producer.produce(item))
+                        .expect("failed to send produced batch");
+                }
+                producer.finish();
+                FetchOutcome::Completed
+            }),
+        )
     }
 
     // Consume every delivered item, then report why the stream ended.
@@ -91,63 +140,47 @@ fn bitcoind_fetcher(
     daemon: &Daemon,
     new_headers: Vec<HeaderEntry>,
     batch_size: usize,
-    chain_tip_height: usize,
 ) -> Result<Fetcher<Vec<BlockEntry>>> {
     if let Some(tip) = new_headers.last() {
         debug!("{:?} ({} left to index)", tip, new_headers.len());
     };
     let daemon = daemon.reconnect()?;
-    let chan = SyncChannel::new(1);
-    let sender = chan.sender();
-    Ok(Fetcher::from(
-        chan.into_receiver(),
-        spawn_thread("bitcoind_fetcher", move || {
-            let mut fetcher_count = 0;
-            let total_blocks_fetched = new_headers.len();
-            for entries in new_headers.chunks(batch_size) {
-                if signal::shutdown_requested() {
-                    return FetchOutcome::Interrupted;
-                }
-                if fetcher_count % 50 == 0 && total_blocks_fetched >= 50 {
-                    let batch_height = entries.last().map(|e| e.height()).unwrap_or(0);
-                    info!("fetching blocks {}/{} ({:.1}%)",
-                        batch_height,
-                        chain_tip_height,
-                        batch_height as f32 / chain_tip_height.max(1) as f32 * 100.0
-                    );
-                }
-                fetcher_count += 1;
-
-                let blockhashes: Vec<BlockHash> = entries.iter().map(|e| *e.hash()).collect();
-                let blocks = daemon
-                    .getblocks(&blockhashes)
-                    .expect("failed to get blocks from bitcoind");
-                assert_eq!(blocks.len(), entries.len());
-                let block_entries: Vec<BlockEntry> = blocks
-                    .into_iter()
-                    .zip(entries)
-                    .map(|(block, entry)| {
-                        let txids = block.txdata.iter().map(|tx| tx.compute_txid()).collect();
-                        BlockEntry {
-                            entry: entry.clone(), // TODO: remove this clone()
-                            size: block.total_size() as u32,
-                            txids,
-                            block,
-                        }
-                    })
-                    .collect();
-                assert_eq!(block_entries.len(), entries.len());
-                sender
-                    .send(block_entries)
-                    .expect("failed to send fetched blocks");
-                log::debug!("last fetch {:?}", entries.last());
-            }
-            FetchOutcome::Completed
-        }),
-    ))
+    let chunks = chunked(new_headers, batch_size);
+    Ok(Fetcher::produce("bitcoind_fetcher", chunks, RpcFetch { daemon }))
 }
 
-#[trace]
+// Fetches block batches over bitcoind's RPC.
+struct RpcFetch {
+    daemon: Daemon,
+}
+
+impl Producer for RpcFetch {
+    type Item = Vec<HeaderEntry>;
+    type Batch = Vec<BlockEntry>;
+
+    fn produce(&mut self, entries: Vec<HeaderEntry>) -> Vec<BlockEntry> {
+        let blockhashes: Vec<BlockHash> = entries.iter().map(|e| *e.hash()).collect();
+        let blocks = self
+            .daemon
+            .getblocks(&blockhashes)
+            .expect("failed to get blocks from bitcoind");
+        assert_eq!(blocks.len(), entries.len());
+        blocks
+            .into_iter()
+            .zip(entries)
+            .map(|(block, entry)| {
+                let txids = block.txdata.iter().map(|tx| tx.compute_txid()).collect();
+                BlockEntry {
+                    entry,
+                    size: block.total_size() as u32,
+                    txids,
+                    block,
+                }
+            })
+            .collect()
+    }
+}
+
 fn blkfiles_fetcher(
     daemon: &Daemon,
     new_headers: Vec<HeaderEntry>,
@@ -484,43 +517,29 @@ impl BlockLocator {
 // a restart re-scan costs page faults on ~1% of the data instead of reading
 // and deserializing all of it (and bitcoind's own use of these files keeps
 // the head pages warm in the page cache).
-fn blkfiles_walker(blk_files: Vec<PathBuf>, mut locator: BlockLocator) -> Fetcher<Vec<RawBlock>> {
-    let chan = SyncChannel::new(2);
-    let sender = chan.sender();
+fn blkfiles_walker(blk_files: Vec<PathBuf>, locator: BlockLocator) -> Fetcher<Vec<RawBlock>> {
+    Fetcher::produce("blkfiles_walker", blk_files, locator)
+}
 
-    Fetcher::from(
-        chan.into_receiver(),
-        spawn_thread("blkfiles_walker", move || {
-            let blk_files_len = blk_files.len();
-            for (count, path) in blk_files.iter().enumerate() {
-                if signal::shutdown_requested() {
-                    info!("blk file walker stopping at {}/{}", count, blk_files_len);
-                    return FetchOutcome::Interrupted;
-                }
-                info!("block file reading {:}/{:} {:.2}%",
-                    count,
-                    blk_files_len,
-                    count / blk_files_len
-                );
+impl Producer for BlockLocator {
+    type Item = PathBuf;
+    type Batch = Vec<RawBlock>;
 
-                let batch = locator
-                    .locate(path)
-                    .unwrap_or_else(|e| panic!("failed to read {:?}: {:?}", path, e));
-                sender
-                    .send(batch)
-                    .unwrap_or_else(|_| panic!("failed to send {:?} contents", path));
-            }
-            // an interrupted walk legitimately leaves blocks unfound; a
-            // completed one must have located every requested block
-            if locator.missing() != 0 {
-                panic!(
-                    "failed to locate {} blocks in blk*.dat files",
-                    locator.missing()
-                )
-            }
-            FetchOutcome::Completed
-        }),
-    )
+    fn produce(&mut self, path: PathBuf) -> Vec<RawBlock> {
+        self.locate(&path)
+            .unwrap_or_else(|e| panic!("failed to read {:?}: {:?}", path, e))
+    }
+
+    // an interrupted walk legitimately leaves blocks unfound; a completed
+    // one must have located every requested block
+    fn finish(self) {
+        if self.missing() != 0 {
+            panic!(
+                "failed to locate {} blocks in blk*.dat files",
+                self.missing()
+            )
+        }
+    }
 }
 
 // Deserialize the located blocks and compute their txids, in parallel —

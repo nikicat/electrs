@@ -88,6 +88,17 @@ impl<T> Channel<T> {
     }
 }
 
+// Owned fixed-size chunks: the elements move, unlike slice::chunks (which
+// borrows) or chunks().map(to_vec) (which transiently doubles the memory).
+pub fn chunked<T>(items: Vec<T>, chunk_size: usize) -> Vec<Vec<T>> {
+    let mut chunks = Vec::with_capacity(items.len().div_ceil(chunk_size));
+    let mut it = items.into_iter().peekable();
+    while it.peek().is_some() {
+        chunks.push(it.by_ref().take(chunk_size).collect());
+    }
+    chunks
+}
+
 pub fn spawn_thread<F, T>(name: &str, f: F) -> thread::JoinHandle<T>
 where
     F: FnOnce() -> T,
@@ -134,4 +145,18 @@ pub fn create_socket(addr: &SocketAddr) -> Socket {
     socket.bind(&addr.clone().into()).expect("cannot bind");
 
     socket
+}
+
+#[cfg(test)]
+mod tests {
+    use super::chunked;
+
+    #[test]
+    fn chunked_moves_elements_into_full_and_remainder_chunks() {
+        assert_eq!(
+            chunked(vec![1, 2, 3, 4, 5], 2),
+            vec![vec![1, 2], vec![3, 4], vec![5]]
+        );
+        assert_eq!(chunked(Vec::<u8>::new(), 3), Vec::<Vec<u8>>::new());
+    }
 }
