@@ -23,4 +23,3 @@ mod types;
 pub use server::run;
 
 use bindex::bitcoin;
-use bindex::bitcoin_slices;

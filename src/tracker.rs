@@ -1,5 +1,4 @@
 use crate::bitcoin::{BlockHash, Txid};
-use crate::bitcoin_slices::{bsl, EmptyVisitor, Visit};
 use anyhow::{Context, Result};
 use bindex::IndexedChain;
 
@@ -72,18 +71,10 @@ impl Tracker {
         // Note: there are two blocks with coinbase transactions having same txid (see BIP-30)
         for loc in self.index.locations_by_txid(&txid)? {
             let tx_bytes = self.index.get_tx_bytes(&loc)?;
-            if txid == compute_txid(&tx_bytes)? {
+            if txid == bindex::hash::txid(&tx_bytes)? {
                 return Ok(Some((loc.block_hash(), tx_bytes.into_boxed_slice())));
             }
         }
         Ok(None)
     }
-}
-
-fn compute_txid(tx_bytes: &[u8]) -> Result<Txid> {
-    let mut visit = EmptyVisitor {};
-    let res = bsl::Transaction::visit(tx_bytes, &mut visit)
-        .map_err(|err| anyhow!("invalid transaction: {:?}", err))?;
-    ensure!(res.remaining().is_empty(), "non-empty remaining bytes");
-    Ok(Txid::from_raw_hash(res.parsed().txid()))
 }

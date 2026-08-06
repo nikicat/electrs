@@ -33,7 +33,7 @@ impl Proof {
                     let left = pair[0];
                     let right = pair[1];
                     let input = [&left[..], &right[..]].concat();
-                    TxMerkleNode::hash(&input)
+                    TxMerkleNode::from_byte_array(bindex::hash::sha256d(&input))
                 })
                 .collect()
         }
