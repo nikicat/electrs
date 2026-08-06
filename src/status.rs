@@ -1,9 +1,9 @@
 use crate::bitcoin::{
-    consensus::Decodable,
-    hashes::{sha256, Hash, HashEngine},
-    Amount, BlockHash, OutPoint, SignedAmount, Transaction, Txid,
+    consensus::Decodable, hashes::Hash, Amount, BlockHash, OutPoint, SignedAmount, Transaction,
+    Txid,
 };
 use anyhow::Result;
+use bindex::hash::{self, HashEngine};
 use bindex::{IndexedChain, ScriptHash};
 use serde::ser::{Serialize, Serializer};
 
@@ -11,6 +11,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryFrom;
 
 use crate::{mempool::Mempool, types::StatusHash};
+
+/// How many transactions to fetch concurrently per batch: large enough to
+/// keep the fetch pool busy, small enough to bound the bytes held in memory.
+const FETCH_CHUNK_SIZE: usize = 1024;
 
 /// Given a scripthash, store relevant inputs and outputs of a specific transaction
 struct TxEntry {
@@ -95,7 +99,7 @@ pub(crate) struct HistoryEntry {
 impl HistoryEntry {
     // Hash to compute ScriptHash status, as defined here:
     // https://electrum-protocol.readthedocs.io/en/latest/protocol-basics.html#status
-    fn hash(&self, engine: &mut sha256::HashEngine) {
+    fn hash(&self, engine: &mut hash::Engine) {
         let s = format!("{}:{}:", self.txid, self.height);
         engine.input(s.as_bytes());
     }
@@ -320,29 +324,36 @@ impl ScriptHashStatus {
         }
         // Recompute all funded outpoints
         let mut outpoints = self.confirmed_outpoints();
-        // Process transactions in chronological order
-        for location in index.locations_by_scripthash(&self.scripthash, latest_header)? {
-            let tx_bytes = index.get_tx_bytes(&location)?;
-            let tx = Transaction::consensus_decode_from_finite_reader(&mut &tx_bytes[..])?;
+        // Fetch transactions' bytes concurrently, chunk by chunk (bounding
+        // the amount fetched ahead), but process them strictly in
+        // chronological order: spend detection threads funded outpoints
+        // from earlier transactions through later ones.
+        let locations: Vec<_> = index
+            .locations_by_scripthash(&self.scripthash, latest_header)?
+            .collect();
+        for chunk in locations.chunks(FETCH_CHUNK_SIZE) {
+            for (location, tx_bytes) in chunk.iter().zip(index.get_txs_bytes(chunk)?) {
+                let tx = Transaction::consensus_decode_from_finite_reader(&mut &tx_bytes[..])?;
 
-            // Check if this transaction has relevant inputs/outputs:
-            let spent = filter_inputs(&tx, &outpoints);
-            let outputs = filter_outputs(&tx, self.scripthash);
-            if spent.is_empty() && outputs.is_empty() {
-                continue;
+                // Check if this transaction has relevant inputs/outputs:
+                let spent = filter_inputs(&tx, &outpoints);
+                let outputs = filter_outputs(&tx, self.scripthash);
+                if spent.is_empty() && outputs.is_empty() {
+                    continue;
+                }
+
+                // Build new TxEntry and add new outpoints (for next transactions)
+                let mut tx_entry = TxEntry::new(hash::txid(&tx_bytes)?);
+                tx_entry.spent = spent;
+                tx_entry.outputs = outputs;
+                outpoints.extend(tx_entry.funding_outpoints());
+
+                // Add new per-block entry (if needed)
+                self.confirmed
+                    .entry(BlockKey::from(*location))
+                    .or_default()
+                    .push(tx_entry);
             }
-
-            // Build new TxEntry and add new outpoints (for next transactions)
-            let mut tx_entry = TxEntry::new(tx.compute_txid());
-            tx_entry.spent = spent;
-            tx_entry.outputs = outputs;
-            outpoints.extend(tx_entry.funding_outpoints());
-
-            // Add new per-block entry (if needed)
-            self.confirmed
-                .entry(BlockKey::from(location))
-                .or_default()
-                .push(tx_entry);
         }
 
         Ok(outpoints)
@@ -439,11 +450,11 @@ fn compute_status_hash(history: &[HistoryEntry]) -> Option<StatusHash> {
     if history.is_empty() {
         return None;
     }
-    let mut engine = StatusHash::engine();
+    let mut engine = hash::Engine::default();
     for entry in history {
         entry.hash(&mut engine);
     }
-    Some(StatusHash::from_engine(engine))
+    Some(StatusHash::from_byte_array(hash::finalize(engine)))
 }
 
 #[cfg(test)]
