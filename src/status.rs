@@ -4,11 +4,12 @@ use crate::bitcoin::{
 };
 use anyhow::Result;
 use bindex::hash::{self, HashEngine};
-use bindex::{IndexedChain, ScriptHash};
+use bindex::{Headers, IndexedChain, IndexedHeader, Location, ScriptHash};
 use serde::ser::{Serialize, Serializer};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryFrom;
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 
 use crate::{mempool::Mempool, types::StatusHash};
 
@@ -120,6 +121,31 @@ impl HistoryEntry {
             },
             fee: Some(fee),
         }
+    }
+}
+
+/// Per-transaction results of the pipeline's parallel stages: everything
+/// the chronological fold needs, precomputed order-independently.
+struct PreparedTx {
+    block_key: BlockKey,
+    txid: Txid,
+    inputs: Vec<OutPoint>,  // all spent outpoints (unfiltered)
+    outputs: Vec<TxOutput>, // relevant funded outputs
+}
+
+impl PreparedTx {
+    fn new(
+        location: &bindex::Location<'_>,
+        tx_bytes: &[u8],
+        scripthash: ScriptHash,
+    ) -> Result<Self> {
+        let tx = Transaction::consensus_decode_from_finite_reader(&mut &tx_bytes[..])?;
+        Ok(Self {
+            block_key: BlockKey::from(*location),
+            txid: hash::txid(tx_bytes)?,
+            inputs: tx.input.iter().map(|txi| txi.previous_output).collect(),
+            outputs: filter_outputs(&tx, scripthash),
+        })
     }
 }
 
@@ -302,61 +328,84 @@ impl ScriptHashStatus {
             .collect()
     }
 
-    /// Get funding and spending entries from new blocks.
-    /// Also cache relevant transactions and their merkle proofs.
-    fn sync_confirmed(&mut self, index: &IndexedChain) -> Result<HashSet<OutPoint>> {
-        let headers = index.headers();
-        let mut latest_header = None;
-        // Drop entries from stale blocks
+    /// Drop entries from stale (reorged) blocks, returning the latest header
+    /// still part of the chain — the cursor to scan new locations from.
+    fn drop_stale_blocks<'a>(&mut self, headers: &'a Headers) -> Option<&'a IndexedHeader> {
         while let Some(entry) = self.confirmed.last_entry() {
             let BlockKey(height, hash) = entry.key();
             match headers.get_header(*hash, *height) {
-                Ok(header) => {
-                    latest_header = Some(header);
-                    break;
-                }
+                Ok(header) => return Some(header),
                 Err(err) => {
                     warn!("drop reorged block: {}", err);
                     entry.remove();
-                    continue;
                 }
             }
         }
+        None
+    }
+
+    /// Get funding and spending entries from new blocks.
+    /// Also cache relevant transactions and their merkle proofs.
+    fn sync_confirmed(&mut self, index: &IndexedChain) -> Result<HashSet<OutPoint>> {
+        let latest_header = self.drop_stale_blocks(index.headers());
         // Recompute all funded outpoints
         let mut outpoints = self.confirmed_outpoints();
-        // Fetch transactions' bytes concurrently, chunk by chunk (bounding
-        // the amount fetched ahead), but process them strictly in
-        // chronological order: spend detection threads funded outpoints
-        // from earlier transactions through later ones.
         let locations: Vec<_> = index
             .locations_by_scripthash(&self.scripthash, latest_header)?
             .collect();
-        for chunk in locations.chunks(FETCH_CHUNK_SIZE) {
-            for (location, tx_bytes) in chunk.iter().zip(index.get_txs_bytes(chunk)?) {
-                let tx = Transaction::consensus_decode_from_finite_reader(&mut &tx_bytes[..])?;
+        if locations.is_empty() {
+            return Ok(outpoints);
+        }
+        // Three-stage pipeline over fixed-size chunks (bounded channels keep
+        // at most a few chunks in flight): fetch and preparation run on
+        // their own threads, only the chronological fold needs `self`.
+        let scripthash = self.scripthash;
+        let (fetched_tx, fetched_rx) = sync_channel(1);
+        let (prepared_tx, prepared_rx) = sync_channel(1);
+        std::thread::scope(|scope| {
+            scope.spawn(|| fetch_chunks(index, &locations, fetched_tx));
+            scope.spawn(move || prepare_chunks(fetched_rx, scripthash, prepared_tx));
+            self.fold_prepared(prepared_rx, &mut outpoints)
+        })?;
 
+        Ok(outpoints)
+    }
+
+    /// Pipeline stage 3: fold prepared transactions in strict chronological
+    /// order — spend detection threads funded outpoints from earlier
+    /// transactions through later ones.
+    fn fold_prepared(
+        &mut self,
+        prepared: Receiver<Result<Vec<PreparedTx>>>,
+        outpoints: &mut HashSet<OutPoint>,
+    ) -> Result<()> {
+        // an early return drops the receiver, unblocking both producers
+        for chunk in prepared {
+            for p in chunk? {
                 // Check if this transaction has relevant inputs/outputs:
-                let spent = filter_inputs(&tx, &outpoints);
-                let outputs = filter_outputs(&tx, self.scripthash);
-                if spent.is_empty() && outputs.is_empty() {
+                let spent: Vec<OutPoint> = p
+                    .inputs
+                    .into_iter()
+                    .filter(|outpoint| outpoints.contains(outpoint))
+                    .collect();
+                if spent.is_empty() && p.outputs.is_empty() {
                     continue;
                 }
 
                 // Build new TxEntry and add new outpoints (for next transactions)
-                let mut tx_entry = TxEntry::new(hash::txid(&tx_bytes)?);
+                let mut tx_entry = TxEntry::new(p.txid);
                 tx_entry.spent = spent;
-                tx_entry.outputs = outputs;
+                tx_entry.outputs = p.outputs;
                 outpoints.extend(tx_entry.funding_outpoints());
 
                 // Add new per-block entry (if needed)
                 self.confirmed
-                    .entry(BlockKey::from(*location))
+                    .entry(p.block_key)
                     .or_default()
                     .push(tx_entry);
             }
         }
-
-        Ok(outpoints)
+        Ok(())
     }
 
     /// Get funding and spending entries from current mempool.
@@ -415,6 +464,51 @@ impl ScriptHashStatus {
     /// Get current status hash.
     pub fn statushash(&self) -> Option<StatusHash> {
         self.statushash
+    }
+}
+
+/// A chunk of locations with their fetched transactions' bytes.
+type FetchedChunk<'a> = (&'a [Location<'a>], Vec<Vec<u8>>);
+
+/// Pipeline stage 1: fetch each chunk's transactions from bitcoind
+/// (concurrently within a chunk) and pass them on in order. Stops on fetch
+/// failure (after sending the error) or when the consumer hangs up.
+fn fetch_chunks<'a>(
+    index: &IndexedChain,
+    locations: &'a [Location<'a>],
+    results: SyncSender<Result<FetchedChunk<'a>>>,
+) {
+    for chunk in locations.chunks(FETCH_CHUNK_SIZE) {
+        let fetched = index
+            .get_txs_bytes(chunk)
+            .map(|bytes| (chunk, bytes))
+            .map_err(anyhow::Error::from);
+        let failed = fetched.is_err();
+        if results.send(fetched).is_err() || failed {
+            return;
+        }
+    }
+}
+
+/// Pipeline stage 2: decode transactions and precompute everything
+/// order-independent. Stop conditions as above.
+fn prepare_chunks(
+    fetched: Receiver<Result<FetchedChunk>>,
+    scripthash: ScriptHash,
+    results: SyncSender<Result<Vec<PreparedTx>>>,
+) {
+    for chunk in fetched {
+        let prepared = chunk.and_then(|(locations, bytes)| {
+            locations
+                .iter()
+                .zip(bytes)
+                .map(|(location, tx_bytes)| PreparedTx::new(location, &tx_bytes, scripthash))
+                .collect()
+        });
+        let failed = prepared.is_err();
+        if results.send(prepared).is_err() || failed {
+            return;
+        }
     }
 }
 

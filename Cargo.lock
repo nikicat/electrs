@@ -60,7 +60,7 @@ checksum = "d965446196e3b7decd44aa7ee49e31d630118f90ef12f97900f262eb915c951d"
 [[package]]
 name = "bindex"
 version = "0.1.2"
-source = "git+https://github.com/nikicat/bindex-rs?rev=35c7a0c3ece69f1ebc59220de69f72fcbf3ad8fc#35c7a0c3ece69f1ebc59220de69f72fcbf3ad8fc"
+source = "git+https://github.com/nikicat/bindex-rs?rev=b1e92300f1941b5d831822d361f6920e159c1695#b1e92300f1941b5d831822d361f6920e159c1695"
 dependencies = [
  "bitcoin",
  "bitcoin_hashes 1.2.0",
