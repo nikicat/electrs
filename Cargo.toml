@@ -23,7 +23,7 @@ spec = "internal/config_specification.toml"
 
 [dependencies]
 anyhow = "1.0"
-bindex = { git = "https://github.com/nikicat/bindex-rs", rev = "b1e92300f1941b5d831822d361f6920e159c1695", default-features = false, features = ["bitcoin_serde"] }
+bindex = { git = "https://github.com/nikicat/bindex-rs", rev = "615b95a1f8d07931089e8dbf90c69c8c63b5c595", default-features = false, features = ["bitcoin_serde"] }
 configure_me = "0.4"
 crossbeam-channel = "0.5"
 dirs-next = "2.0"
